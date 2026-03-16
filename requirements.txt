@@ -1,0 +1,7 @@
+streamlit>=1.28.0
+openai-whisper>=20231117
+jiwer>=3.0.0
+rouge>=1.0.0
+python-docx>=0.8.0
+torch>=2.0.0
+numpy>=1.24.0
