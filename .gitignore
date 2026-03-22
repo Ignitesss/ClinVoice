@@ -24,3 +24,14 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Model files (too large for GitHub)
+ClinVoice/
+finetuned_model/
+*.safetensors
+model.safetensors
+ten_audios/
+
+# OpenClaw workspace files
+.openclaw/
+*.json
