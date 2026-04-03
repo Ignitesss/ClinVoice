@@ -53,17 +53,20 @@ METRICS_SHEET_HEADERS: tuple[str, ...] = (
 )
 
 
-class _PostPreservingRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _SheetsRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
-    Google Apps Script /exec часто отвечает 302; стандартный клиент сбрасывает POST.
-    Повторяем POST с тем же телом на Location.
+    Web app Apps Script на первом POST выполняет doPost и часто отвечает 302/303
+    с Location на script.googleusercontent.com (страница «результата»).
+    Повторный POST туда даёт 405, хотя строка в таблице уже записана.
+    Для 301/302/303 оставляем поведение urllib: следовать редиректу GET без тела.
+    POST с тем же телом сохраняем только для 307/308 (если Google когда-либо так ответит).
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         method = req.get_method()
         if method != "POST" or req.data is None:
             return super().redirect_request(req, fp, code, msg, headers, newurl)
-        if code not in (301, 302, 303, 307, 308):
+        if code not in (307, 308):
             return super().redirect_request(req, fp, code, msg, headers, newurl)
         new_headers = {}
         for k, v in req.header_items():
@@ -80,7 +83,7 @@ class _PostPreservingRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _sheets_opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(_PostPreservingRedirectHandler())
+    return urllib.request.build_opener(_SheetsRedirectHandler())
 
 
 def _sheets_url_and_secret() -> tuple[Optional[str], Optional[str]]:
