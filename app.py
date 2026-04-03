@@ -13,7 +13,11 @@ import os
 import torch
 from typing import Optional
 
-from metrics_sheets import build_metrics_row, submit_metrics_row_to_sheets
+from metrics_sheets import (
+    build_metrics_row,
+    metrics_sheets_secrets_configured,
+    submit_metrics_row_to_sheets,
+)
 
 # For loading fine-tuned Whisper models
 try:
@@ -307,6 +311,7 @@ st.markdown("**Распознавание речи для медицинских
 # Check URL for dev mode
 query_params = st.query_params
 is_dev_mode = query_params.get("mode") == "dev"
+metrics_debug = query_params.get("metrics_debug") == "1"
 
 # Show sidebar only in dev mode
 if is_dev_mode:
@@ -351,6 +356,11 @@ else:
 # ============ DOCTOR MODE ============
 if mode == "Doctor Mode":
     st.header("Запись консультации")
+    if metrics_debug and not metrics_sheets_secrets_configured():
+        st.info(
+            "Отладка метрик (`metrics_debug=1`): не заданы `CLINVOICE_SHEETS_WEBAPP_URL` "
+            "или `CLINVOICE_SHEETS_SECRET` в Secrets / окружении."
+        )
     st.warning(
         "При первом запуске загрузка и настройка приложения могут занять несколько минут — это нормально."
     )
@@ -415,7 +425,15 @@ if mode == "Doctor Mode":
                 rouge_results,
                 resolve_hub_model_id(),
             )
-            submit_metrics_row_to_sheets(row)
+            _ok, _metrics_err = submit_metrics_row_to_sheets(row)
+            if metrics_debug:
+                if _ok:
+                    st.success("Метрики: отправка успешна (режим отладки `metrics_debug=1`).")
+                else:
+                    st.warning(
+                        "Метрики: отправка не удалась — "
+                        + (_metrics_err or "неизвестная ошибка")
+                    )
             
             st.session_state.doctor_metrics_saved = True
         
