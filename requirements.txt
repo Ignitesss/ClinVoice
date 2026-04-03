@@ -4,4 +4,7 @@ jiwer>=3.0.0
 rouge>=1.0.0
 python-docx>=0.8.0
 torch>=2.0.0
+torchvision>=0.15.0
 numpy>=1.24.0
+transformers>=4.30.0
+librosa>=0.10.0

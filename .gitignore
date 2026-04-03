@@ -1,14 +1,9 @@
 # Virtual environment
-clinvoice_env/
-venv/
+.venv/
 env/
 
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
 
 # Streamlit
 .streamlit/
@@ -25,13 +20,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Model files (too large for GitHub)
-ClinVoice/
-finetuned_model/
-*.safetensors
-model.safetensors
-ten_audios/
-
-# OpenClaw workspace files
-.openclaw/
-*.json
+sheets.txt
+audios/

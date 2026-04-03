@@ -1,0 +1,1 @@
+https://huggingface.co/Ignites/fine_tuned_med_whisper_rus

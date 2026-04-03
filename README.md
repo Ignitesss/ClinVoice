@@ -1,8 +1,8 @@
-# ClinVoice - Распознавание речи для медицинских консультаций
+# ClinVoice - сервис распознавания речи для медицинских консультаций
 
-A Streamlit app for doctors to transcribe patient consultations with Active Speech Recognition.
+Приложение для докторов, использующее распознавания речи в реальном времени. Просто говорите - приложение само напечатает.
 
-## Setup
+## Установка
 
 ```bash
 pip install -r requirements.txt
@@ -15,50 +15,52 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+Либо просто перейдите по ссылке, чтобы попробовать наш сервис - https://clinvoice-ijy9bcmuqtja7et8q748vd.streamlit.app/
+
 ## Возможности
 
 ### 1. Режим врача
 - Простой текст + ключевые слова
-- Скачиваемый протокол в .docx
-- Для врачей, которым нужна просто транскрибация
+- Скачиваемый протокол в .docx или .txt
 
-### 2. Режим разработчика
+### 2. Режим разработчика (скрыт от обычного пользователя)
 - WER (Word Error Rate)
 - ROUGE-1, ROUGE-2, ROUGE-L метрики
-- Приоритетные ключевые слова
 - Детальный анализ слов (совпадающие, пропущенные, лишние)
-- Для тестирования и оценки качества модели
 
-### 3. Сравнение моделей
+### 3. Сравнение моделей (скрыт от обычного пользователя)
 - Сравнение двух моделей Whisper
-- Разница в WER
-- Сравнение ключевых слов
+- Разница в метриках
 
-## Requirements
+## Требования к системе
 
 - Python 3.8+
 - FFmpeg (system)
 - ~2GB disk space for Whisper models
 
-## Usage
+## Как пользоваться?
 
-1. Select mode from sidebar
-2. Upload audio file
-3. Click "Transcribe" / "Compare" / "Fine-tune"
-4. Download results
+1. Нажмите на микрофон и начните говорить.
+2. Нажмите на кнопку "Транскрибировать".
+3. Дождитесь результатов транскрибации.
+4. Исправьте ошибки в тексте (если требуется)
+5. Получите свой результат
 
-## Project Structure
-
+## Структура проекта
 ```
-workspace/
-├── app.py           # Main Streamlit app
-├── requirements.txt # Dependencies
-├── README.md        # This file
+README.md #this file
+ClinVoice/              
+│   ├── app.py              
+│   ├── requirements.txt    
+│   ├── README.md
+│   ├── .gitignore
+│   └── finetuned_model/    
+│       ├── config.json
+│       ├── generation_config.json
+│       └── model.safetensors
 ```
 
-## For Team
+## Команда
 
-- **Yana** works on UI and integration
-- **Teammate** fine-tunes Whisper with medical terms → provides model
-- Both use Developer Mode for testing
-# ClinVoice
+- **Яна** - занимается разработкой приложения и интеграцией, а также тестированием
+- **Любовь** - занимается дообучением модели Whisper на медицинском словаре (сделан нами), а также тестированием
