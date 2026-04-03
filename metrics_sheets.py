@@ -141,6 +141,45 @@ def _truncate(msg: str) -> str:
     return msg
 
 
+def _validate_webapp_url(url: str) -> Optional[str]:
+    """Возвращает текст ошибки, если URL явно не от Apps Script Web App."""
+    low = url.strip().lower()
+    if "docs.google.com/spreadsheets" in low or "/spreadsheets/d/" in low:
+        return (
+            "В секретах указана ссылка на таблицу. Нужен URL веб-приложения: "
+            "Google Таблица → Расширения → Apps Script → Deploy → Manage deployments → "
+            "скопировать URL у актуального deployment (вид …/script.google.com/macros/s/…/exec)."
+        )
+    if "script.google.com" not in low:
+        return (
+            "URL должен быть с домена script.google.com (его выдаёт только Deploy → Web app в Apps Script), "
+            "не ссылка на docs.google.com и не произвольный сайт."
+        )
+    if "/macros/" not in low:
+        return "В URL должно быть /macros/s/…/exec как в окне публикации Web app."
+    path_before_query = low.split("?", 1)[0].rstrip("/")
+    if not path_before_query.endswith("/exec"):
+        return "URL веб-приложения должен заканчиваться на /exec (скопируйте целиком из Deploy)."
+    return None
+
+
+def _humanize_google_error(http_code: int, body: str) -> str:
+    """Подсказка при HTML-ответе Google вместо JSON от doPost."""
+    b = body.lower()
+    looks_like_html = "<!doctype" in b or "<html" in b
+    looks_like_not_found = "page not found" in b or "не найден" in b
+    if http_code in (401, 403, 404) and (looks_like_html or looks_like_not_found):
+        return (
+            "Google вернул страницу ошибки вместо скрипта. Чаще всего: "
+            "неверный URL (старый deployment, опечатка) или в Deploy не выбран доступ «Anyone» / «Все». "
+            "Сделайте Deploy → New deployment → Web app, выполнять от вашего пользователя, "
+            "доступ «Anyone», затем снова скопируйте URL …/macros/s/…/exec в Streamlit Secrets."
+        )
+    if looks_like_html and http_code >= 400:
+        return "Ответ — HTML, а не JSON: проверьте URL Web app и настройки доступа к deployment."
+    return ""
+
+
 def submit_metrics_row_to_sheets(row: List[Any]) -> Tuple[bool, Optional[str]]:
     """
     POST JSON { "secret": "...", "row": [...] } на Web App.
@@ -150,6 +189,10 @@ def submit_metrics_row_to_sheets(row: List[Any]) -> Tuple[bool, Optional[str]]:
     url, secret = _sheets_url_and_secret()
     if not url or not secret:
         return False, "Не заданы CLINVOICE_SHEETS_WEBAPP_URL или CLINVOICE_SHEETS_SECRET"
+
+    bad_url = _validate_webapp_url(url)
+    if bad_url:
+        return False, bad_url
 
     payload = json.dumps({"secret": secret, "row": row}, ensure_ascii=False)
     req = urllib.request.Request(
@@ -163,7 +206,15 @@ def submit_metrics_row_to_sheets(row: List[Any]) -> Tuple[bool, Optional[str]]:
         with opener.open(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             if resp.status != 200:
-                msg = f"HTTP {resp.status}: {_truncate(body)}"
+                hint = _humanize_google_error(resp.status, body)
+                blo = body.lower()
+                noisy_html = "<!doctype" in blo or "<html" in blo
+                tail = (
+                    "[ответ — HTML-страница Google]"
+                    if (hint and noisy_html)
+                    else _truncate(body)
+                )
+                msg = f"HTTP {resp.status}. {hint} {tail}".strip()
                 logger.warning("metrics_sheets: %s", msg)
                 return False, msg
             try:
@@ -181,7 +232,15 @@ def submit_metrics_row_to_sheets(row: List[Any]) -> Tuple[bool, Optional[str]]:
             raw = e.read().decode("utf-8", errors="replace")
         except Exception:
             raw = ""
-        msg = f"HTTP {e.code}: {_truncate(raw)}"
+        hint = _humanize_google_error(e.code, raw)
+        blo = raw.lower()
+        noisy_html = "<!doctype" in blo or "<html" in blo
+        tail = (
+            "[ответ — HTML-страница Google]"
+            if (hint and noisy_html)
+            else (_truncate(raw) if raw else "")
+        )
+        msg = f"HTTP {e.code}. {hint} {tail}".strip()
         logger.warning("metrics_sheets: %s", msg)
         return False, msg
     except urllib.error.URLError as e:
