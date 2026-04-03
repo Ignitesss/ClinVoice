@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 _MAX_DIAG_MSG = 500
 
+# Google иногда отвечает 405/403 на POST без привычного User-Agent.
+_SHEETS_POST_HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ClinVoice/1"
+    ),
+}
+
 # Порядок колонок = порядок значений в row
 METRICS_SHEET_HEADERS: tuple[str, ...] = (
     "submitted_at",
@@ -158,6 +167,11 @@ def _validate_webapp_url(url: str) -> Optional[str]:
     if "/macros/" not in low:
         return "В URL должно быть /macros/s/…/exec как в окне публикации Web app."
     path_before_query = low.split("?", 1)[0].rstrip("/")
+    if path_before_query.endswith("/dev"):
+        return (
+            "Указан URL тестового развёртывания …/dev — для POST из Streamlit нужен production URL, "
+            "оканчивающийся на /exec (Deploy → Manage deployments → Web app → скопировать URL)."
+        )
     if not path_before_query.endswith("/exec"):
         return "URL веб-приложения должен заканчиваться на /exec (скопируйте целиком из Deploy)."
     return None
@@ -168,6 +182,13 @@ def _humanize_google_error(http_code: int, body: str) -> str:
     b = body.lower()
     looks_like_html = "<!doctype" in b or "<html" in b
     looks_like_not_found = "page not found" in b or "не найден" in b
+    if http_code == 405:
+        return (
+            "Сервер не принял POST (405 Method Not Allowed): по этому адресу нельзя вызвать doPost. "
+            "Проверьте, что в secrets указан именно URL Web app …/macros/s/…/exec из "
+            "Deploy → Manage deployments (не ссылка на таблицу, не …/dev). После изменений кода в Apps Script "
+            "создайте новый deployment и обновите URL в secrets."
+        )
     if http_code in (401, 403, 404) and (looks_like_html or looks_like_not_found):
         return (
             "Google вернул страницу ошибки вместо скрипта. Чаще всего: "
@@ -198,7 +219,7 @@ def submit_metrics_row_to_sheets(row: List[Any]) -> Tuple[bool, Optional[str]]:
     req = urllib.request.Request(
         url,
         data=payload.encode("utf-8"),
-        headers={"Content-Type": "application/json; charset=utf-8"},
+        headers=dict(_SHEETS_POST_HEADERS),
         method="POST",
     )
     opener = _sheets_opener()
