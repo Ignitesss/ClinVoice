@@ -26,8 +26,7 @@ from protocol import (
     fill_protocol_from_transcript,
     format_protocol_editor_text,
     parse_protocol_editor_text,
-    resolve_openai_api_key,
-    resolve_openai_model,
+    yandex_llm_configured,
 )
 
 # For loading fine-tuned Whisper models
@@ -440,11 +439,11 @@ if mode == "Doctor Mode":
         st.success("Запись завершена! ✓")
 
         if st.button("Транскрибировать и заполнить протокол", type="primary"):
-            api_key = resolve_openai_api_key()
-            if not api_key:
+            if not yandex_llm_configured():
                 st.error(
-                    "Не задан **OPENAI_API_KEY**: добавьте ключ в переменные окружения "
-                    "или в Streamlit Secrets."
+                    "Не заданы параметры для заполнения протокола: укажите "
+                    "**YANDEX_FOLDER_ID** и (**YANDEX_CLOUD_API_KEY** или **YANDEX_IAM_TOKEN**) "
+                    "в переменных окружения или в секретах приложения."
                 )
                 st.stop()
 
@@ -461,19 +460,15 @@ if mode == "Doctor Mode":
             st.session_state.protocol_consultation_date = format_consultation_date_gmt3()
 
             try:
-                with st.spinner("Заполнение протокола (ИИ)..."):
-                    protocol = fill_protocol_from_transcript(
-                        transcription,
-                        api_key,
-                        model=resolve_openai_model(),
-                    )
+                with st.spinner("Заполнение протокола..."):
+                    protocol = fill_protocol_from_transcript(transcription)
                 st.session_state.protocol_editor_text = format_protocol_editor_text(
                     st.session_state.protocol_consultation_date,
                     protocol,
                 )
                 st.success("Готово. Проверьте и при необходимости отредактируйте протокол ниже.")
             except Exception as e:
-                st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
+                st.error(f"Ошибка заполнения протокола: {e}")
                 st.session_state.protocol_editor_text = format_protocol_editor_text(
                     st.session_state.protocol_consultation_date,
                     {k: "" for k in PROTOCOL_FIELD_KEYS},
@@ -537,7 +532,7 @@ if mode == "Doctor Mode":
 
         st.subheader("Скачать протокол")
         col1, col2 = st.columns(2)
-        meta = {"model_whisper": resolve_hub_model_id(), "model_llm": resolve_openai_model()}
+        meta = {"model_whisper": resolve_hub_model_id()}
         doc = create_structured_protocol_docx(fields, consultation_date, metadata=meta)
         doc_path = "/tmp/protocol.docx"
         doc.save(doc_path)
@@ -606,11 +601,10 @@ elif mode == "Developer Mode":
             st.session_state.transcription_done = False
 
         if st.button("Транскрибировать и заполнить протокол", type="primary"):
-            api_key = resolve_openai_api_key()
-            if not api_key:
+            if not yandex_llm_configured():
                 st.error(
-                    "Не задан **OPENAI_API_KEY**: добавьте ключ в переменные окружения "
-                    "или в Streamlit Secrets."
+                    "Не заданы **YANDEX_FOLDER_ID** и ключ доступа (**YANDEX_CLOUD_API_KEY**) "
+                    "или **YANDEX_IAM_TOKEN** в переменных окружения или секретах приложения."
                 )
                 st.stop()
 
@@ -635,19 +629,15 @@ elif mode == "Developer Mode":
                 st.session_state.pop("rouge_results", None)
 
             try:
-                with st.spinner("Заполнение протокола (ИИ)..."):
-                    protocol = fill_protocol_from_transcript(
-                        transcription,
-                        api_key,
-                        model=resolve_openai_model(),
-                    )
+                with st.spinner("Заполнение протокола..."):
+                    protocol = fill_protocol_from_transcript(transcription)
                 st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
                     st.session_state.dev_protocol_consultation_date,
                     protocol,
                 )
                 st.success("Готово. Проверьте транскрипт, метрики и протокол.")
             except Exception as e:
-                st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
+                st.error(f"Ошибка заполнения протокола: {e}")
                 st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
                     st.session_state.dev_protocol_consultation_date,
                     {k: "" for k in PROTOCOL_FIELD_KEYS},
@@ -704,7 +694,7 @@ elif mode == "Developer Mode":
             else:
                 st.info("Добавьте эталонный текст выше, чтобы увидеть метрики")
 
-            st.subheader("Протокол консультации (ИИ)")
+            st.subheader("Протокол консультации")
             st.text_area(
                 "Протокол (редактирование)",
                 height=320,
@@ -780,7 +770,6 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
             )
             dev_meta = {
                 "model_whisper": hub_model_id or f"openai-whisper-{model_size}",
-                "model_llm": resolve_openai_model(),
                 "mode": "Developer Mode",
             }
             sdoc = create_structured_protocol_docx(dev_fields, dev_consultation_date, metadata=dev_meta)
