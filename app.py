@@ -21,7 +21,7 @@ from metrics_sheets import (
     submit_metrics_row_to_sheets,
 )
 
-from protocol_openai import (
+from protocol import (
     PROTOCOL_FIELD_KEYS,
     fill_protocol_from_transcript,
     resolve_openai_api_key,
