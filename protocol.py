@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Поля JSON = ключи словаря протокола (совпадают с OpenAI schema)
 PROTOCOL_FIELD_KEYS = ("complaints", "anamnesis", "conclusion", "recommendations")
@@ -133,3 +133,66 @@ def fill_protocol_from_transcript(transcript: str, api_key: str, model: Optional
         val = data.get(key)
         out[key] = val.strip() if isinstance(val, str) else ("" if val is None else str(val))
     return out
+
+
+def format_protocol_editor_text(consultation_date: str, fields: Dict[str, str]) -> str:
+    """
+    Один блок для редактирования: заголовки с двоеточием и текст от модели / врача.
+    """
+    c = (fields.get("complaints") or "").strip()
+    a = (fields.get("anamnesis") or "").strip()
+    cl = (fields.get("conclusion") or "").strip()
+    r = (fields.get("recommendations") or "").strip()
+    return (
+        f"Дата: {consultation_date.strip()}\n\n"
+        f"Жалобы: {c}\n\n"
+        f"Анамнез: {a}\n\n"
+        f"Заключение: {cl}\n\n"
+        f"Рекомендации: {r}"
+    )
+
+
+def parse_protocol_editor_text(text: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Разбор текста редактора в дату и четыре поля протокола.
+    Заголовки — строки, начинающиеся с «Дата:», «Жалобы:» и т.д.
+    """
+    out: Dict[str, str] = {k: "" for k in PROTOCOL_FIELD_KEYS}
+    date_str = ""
+    order = [
+        ("Дата", "date"),
+        ("Жалобы", "complaints"),
+        ("Анамнез", "anamnesis"),
+        ("Заключение", "conclusion"),
+        ("Рекомендации", "recommendations"),
+    ]
+    current: Optional[str] = None
+    acc: list[str] = []
+
+    def flush() -> None:
+        nonlocal date_str, out, acc
+        body = "\n".join(acc).strip()
+        if current == "date":
+            date_str = body
+        elif current in out:
+            out[current] = body
+        acc = []
+
+    for raw in (text or "").splitlines():
+        line = raw.rstrip("\r")
+        hit: Optional[str] = None
+        rest = ""
+        for label, key in order:
+            pref = f"{label}:"
+            if line.startswith(pref):
+                hit = key
+                rest = line[len(pref) :].lstrip()
+                break
+        if hit is not None:
+            flush()
+            current = hit
+            acc = [rest] if rest else []
+        elif current is not None:
+            acc.append(line)
+    flush()
+    return date_str, out

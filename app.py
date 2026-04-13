@@ -24,6 +24,8 @@ from metrics_sheets import (
 from protocol import (
     PROTOCOL_FIELD_KEYS,
     fill_protocol_from_transcript,
+    format_protocol_editor_text,
+    parse_protocol_editor_text,
     resolve_openai_api_key,
     resolve_openai_model,
 )
@@ -426,10 +428,8 @@ if mode == "Doctor Mode":
         st.session_state.original_transcription = None
     if "doctor_metrics_saved" not in st.session_state:
         st.session_state.doctor_metrics_saved = False
-    for _fk in PROTOCOL_FIELD_KEYS:
-        _sk = f"proto_{_fk}"
-        if _sk not in st.session_state:
-            st.session_state[_sk] = ""
+    if "protocol_editor_text" not in st.session_state:
+        st.session_state.protocol_editor_text = ""
 
     audio_file = st.audio_input("🎙️ Запись", key="doctor_recorder")
 
@@ -467,15 +467,17 @@ if mode == "Doctor Mode":
                         api_key,
                         model=resolve_openai_model(),
                     )
-                for _k in PROTOCOL_FIELD_KEYS:
-                    st.session_state[f"proto_{_k}"] = protocol[_k]
-                st.success("Готово. Проверьте и при необходимости отредактируйте поля протокола.")
+                st.session_state.protocol_editor_text = format_protocol_editor_text(
+                    st.session_state.protocol_consultation_date,
+                    protocol,
+                )
+                st.success("Готово. Проверьте и при необходимости отредактируйте протокол ниже.")
             except Exception as e:
                 st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
-                for _k in PROTOCOL_FIELD_KEYS:
-                    _sk = f"proto_{_k}"
-                    if _sk not in st.session_state:
-                        st.session_state[_sk] = ""
+                st.session_state.protocol_editor_text = format_protocol_editor_text(
+                    st.session_state.protocol_consultation_date,
+                    {k: "" for k in PROTOCOL_FIELD_KEYS},
+                )
 
     if st.session_state.original_transcription:
         if "doctor_transcript_editor" not in st.session_state:
@@ -517,17 +519,21 @@ if mode == "Doctor Mode":
                     )
             st.session_state.doctor_metrics_saved = True
 
-        _labels = {
-            "complaints": "Жалобы",
-            "anamnesis": "Анамнез",
-            "conclusion": "Заключение",
-            "recommendations": "Рекомендации",
-        }
-        for _k in PROTOCOL_FIELD_KEYS:
-            st.text_area(_labels[_k], key=f"proto_{_k}", height=120)
+        st.text_area(
+            "Протокол (редактирование)",
+            height=320,
+            key="protocol_editor_text",
+            help="Формат: строки «Дата:», «Жалобы:», «Анамнез:», «Заключение:», «Рекомендации:» с двоеточием.",
+        )
 
-        consultation_date = st.session_state.get("protocol_consultation_date") or format_consultation_date_gmt3()
-        fields = {k: st.session_state.get(f"proto_{k}", "") for k in PROTOCOL_FIELD_KEYS}
+        _parsed_date, fields = parse_protocol_editor_text(
+            st.session_state.get("protocol_editor_text", "")
+        )
+        consultation_date = (
+            _parsed_date.strip()
+            or st.session_state.get("protocol_consultation_date")
+            or format_consultation_date_gmt3()
+        )
 
         st.subheader("Скачать протокол")
         col1, col2 = st.columns(2)
@@ -592,10 +598,8 @@ elif mode == "Developer Mode":
         
         st.audio(audio_file, format=audio_file.type)
 
-        for _fk in PROTOCOL_FIELD_KEYS:
-            _sk = f"dev_proto_{_fk}"
-            if _sk not in st.session_state:
-                st.session_state[_sk] = ""
+        if "dev_protocol_editor_text" not in st.session_state:
+            st.session_state.dev_protocol_editor_text = ""
 
         # Initialize session state for results
         if "transcription_done" not in st.session_state:
@@ -637,15 +641,17 @@ elif mode == "Developer Mode":
                         api_key,
                         model=resolve_openai_model(),
                     )
-                for _k in PROTOCOL_FIELD_KEYS:
-                    st.session_state[f"dev_proto_{_k}"] = protocol[_k]
-                st.success("Готово. Проверьте транскрипт, метрики и поля протокола.")
+                st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
+                    st.session_state.dev_protocol_consultation_date,
+                    protocol,
+                )
+                st.success("Готово. Проверьте транскрипт, метрики и протокол.")
             except Exception as e:
                 st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
-                for _k in PROTOCOL_FIELD_KEYS:
-                    _sk = f"dev_proto_{_k}"
-                    if _sk not in st.session_state:
-                        st.session_state[_sk] = ""
+                st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
+                    st.session_state.dev_protocol_consultation_date,
+                    {k: "" for k in PROTOCOL_FIELD_KEYS},
+                )
 
         # Show results if transcription was done
         if st.session_state.transcription_done:
@@ -698,15 +704,13 @@ elif mode == "Developer Mode":
             else:
                 st.info("Добавьте эталонный текст выше, чтобы увидеть метрики")
 
-            _dev_labels = {
-                "complaints": "Жалобы",
-                "anamnesis": "Анамнез",
-                "conclusion": "Заключение",
-                "recommendations": "Рекомендации",
-            }
             st.subheader("Протокол консультации (ИИ)")
-            for _k in PROTOCOL_FIELD_KEYS:
-                st.text_area(_dev_labels[_k], key=f"dev_proto_{_k}", height=120)
+            st.text_area(
+                "Протокол (редактирование)",
+                height=320,
+                key="dev_protocol_editor_text",
+                help="Формат: «Дата:», «Жалобы:», «Анамнез:», «Заключение:», «Рекомендации:».",
+            )
 
             # Downloads
             st.subheader("Скачать отчёт (транскрипция и метрики)")
@@ -766,9 +770,13 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
                 )
 
             st.subheader("Скачать протокол (как у врача)")
-            dev_fields = {k: st.session_state.get(f"dev_proto_{k}", "") for k in PROTOCOL_FIELD_KEYS}
+            _dev_parsed_date, dev_fields = parse_protocol_editor_text(
+                st.session_state.get("dev_protocol_editor_text", "")
+            )
             dev_consultation_date = (
-                st.session_state.get("dev_protocol_consultation_date") or format_consultation_date_gmt3()
+                _dev_parsed_date.strip()
+                or st.session_state.get("dev_protocol_consultation_date")
+                or format_consultation_date_gmt3()
             )
             dev_meta = {
                 "model_whisper": hub_model_id or f"openai-whisper-{model_size}",
