@@ -302,7 +302,7 @@ def format_consultation_date_gmt3() -> str:
     return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M (GMT+3)")
 
 
-def create_structured_protocol_docx(fields: dict, consultation_date: str, metadata=None):
+def create_structured_protocol_docx(fields: dict, consultation_date: str):
     """Протокол: дата → жалобы → анамнез → заключение → рекомендации."""
     doc = Document()
     doc.add_heading("Протокол консультации", 0)
@@ -316,10 +316,6 @@ def create_structured_protocol_docx(fields: dict, consultation_date: str, metada
     for title, body in sections:
         doc.add_heading(title, level=1)
         doc.add_paragraph(body if (body or "").strip() else "—")
-    if metadata:
-        doc.add_heading("Метаданные", level=1)
-        for key, value in metadata.items():
-            doc.add_paragraph(f"{key}: {value}")
     return doc
 
 
@@ -345,17 +341,13 @@ def build_structured_protocol_txt(fields: dict, consultation_date: str) -> str:
     return "\n".join(parts)
 
 
-def create_protocol_docx(transcription, metadata=None):
+def create_protocol_docx(transcription):
     """Legacy: один блок «текст консультации» (Developer / сравнение моделей)."""
     doc = Document()
     doc.add_heading("Протокол консультации", 0)
     doc.add_paragraph(f"Дата: {format_consultation_date_gmt3()}")
     doc.add_heading("Текст консультации", level=1)
     doc.add_paragraph(transcription)
-    if metadata:
-        doc.add_heading("Метаданные", level=1)
-        for key, value in metadata.items():
-            doc.add_paragraph(f"{key}: {value}")
     return doc
 
 
@@ -532,8 +524,7 @@ if mode == "Doctor Mode":
 
         st.subheader("Скачать протокол")
         col1, col2 = st.columns(2)
-        meta = {"model_whisper": resolve_hub_model_id()}
-        doc = create_structured_protocol_docx(fields, consultation_date, metadata=meta)
+        doc = create_structured_protocol_docx(fields, consultation_date)
         doc_path = "/tmp/protocol.docx"
         doc.save(doc_path)
         with open(doc_path, "rb") as f:
@@ -747,7 +738,7 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
                 )
 
             # DOCX (legacy: один блок текста)
-            doc = create_protocol_docx(transcription, {"model": model_size})
+            doc = create_protocol_docx(transcription)
             doc_path = "/tmp/report.docx"
             doc.save(doc_path)
             with open(doc_path, "rb") as f:
@@ -768,11 +759,7 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
                 or st.session_state.get("dev_protocol_consultation_date")
                 or format_consultation_date_gmt3()
             )
-            dev_meta = {
-                "model_whisper": hub_model_id or f"openai-whisper-{model_size}",
-                "mode": "Developer Mode",
-            }
-            sdoc = create_structured_protocol_docx(dev_fields, dev_consultation_date, metadata=dev_meta)
+            sdoc = create_structured_protocol_docx(dev_fields, dev_consultation_date)
             sdoc_path = "/tmp/dev_protocol.docx"
             sdoc.save(sdoc_path)
             col3, col4 = st.columns(2)
