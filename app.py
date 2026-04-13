@@ -11,12 +11,21 @@ from rouge import Rouge
 from docx import Document
 import os
 import torch
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from metrics_sheets import (
     build_metrics_row,
     metrics_sheets_secrets_configured,
     submit_metrics_row_to_sheets,
+)
+
+from protocol_openai import (
+    PROTOCOL_FIELD_KEYS,
+    fill_protocol_from_transcript,
+    resolve_openai_api_key,
+    resolve_openai_model,
 )
 
 # For loading fine-tuned Whisper models
@@ -285,21 +294,67 @@ class ModelComparator:
         return {'model1': result1, 'model2': result2}
 
 
-# ============ DOCX GENERATION ============
+# ============ DOCX / TXT GENERATION ============
+
+def format_consultation_date_gmt3() -> str:
+    """Дата/время в поясе Europe/Moscow (UTC+3)."""
+    return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M (GMT+3)")
+
+
+def create_structured_protocol_docx(fields: dict, consultation_date: str, metadata=None):
+    """Протокол: дата → жалобы → анамнез → заключение → рекомендации."""
+    doc = Document()
+    doc.add_heading("Протокол консультации", 0)
+    doc.add_paragraph(f"Дата: {consultation_date}")
+    sections = [
+        ("Жалобы", fields.get("complaints", "")),
+        ("Анамнез", fields.get("anamnesis", "")),
+        ("Заключение", fields.get("conclusion", "")),
+        ("Рекомендации", fields.get("recommendations", "")),
+    ]
+    for title, body in sections:
+        doc.add_heading(title, level=1)
+        doc.add_paragraph(body if (body or "").strip() else "—")
+    if metadata:
+        doc.add_heading("Метаданные", level=1)
+        for key, value in metadata.items():
+            doc.add_paragraph(f"{key}: {value}")
+    return doc
+
+
+def build_structured_protocol_txt(fields: dict, consultation_date: str) -> str:
+    parts = [
+        "Протокол консультации",
+        "",
+        f"Дата: {consultation_date}",
+        "",
+        "Жалобы",
+        fields.get("complaints", "") or "—",
+        "",
+        "Анамнез",
+        fields.get("anamnesis", "") or "—",
+        "",
+        "Заключение",
+        fields.get("conclusion", "") or "—",
+        "",
+        "Рекомендации",
+        fields.get("recommendations", "") or "—",
+        "",
+    ]
+    return "\n".join(parts)
+
 
 def create_protocol_docx(transcription, metadata=None):
+    """Legacy: один блок «текст консультации» (Developer / сравнение моделей)."""
     doc = Document()
-    doc.add_heading('Протокол консультации', 0)
-    doc.add_paragraph(f'Дата: {os.popen("date +%d.%m.%Y").read().strip()}')
-    
-    doc.add_heading('Текст консультации', level=1)
+    doc.add_heading("Протокол консультации", 0)
+    doc.add_paragraph(f"Дата: {format_consultation_date_gmt3()}")
+    doc.add_heading("Текст консультации", level=1)
     doc.add_paragraph(transcription)
-    
     if metadata:
-        doc.add_heading('Метаданные', level=1)
+        doc.add_heading("Метаданные", level=1)
         for key, value in metadata.items():
-            doc.add_paragraph(f'{key}: {value}')
-    
+            doc.add_paragraph(f"{key}: {value}")
     return doc
 
 
@@ -367,59 +422,85 @@ if mode == "Doctor Mode":
     st.caption("Нажмите на микрофон, чтобы начать запись. Нажмите ещё раз, чтобы остановить.")
     
     # Initialize session state
-    if 'doctor_audio' not in st.session_state:
-        st.session_state.doctor_audio = None
-    if 'doctor_transcription' not in st.session_state:
-        st.session_state.doctor_transcription = None
-    if 'doctor_metrics_saved' not in st.session_state:
+    if "original_transcription" not in st.session_state:
+        st.session_state.original_transcription = None
+    if "doctor_metrics_saved" not in st.session_state:
         st.session_state.doctor_metrics_saved = False
-    
+    for _fk in PROTOCOL_FIELD_KEYS:
+        _sk = f"proto_{_fk}"
+        if _sk not in st.session_state:
+            st.session_state[_sk] = ""
+
     audio_file = st.audio_input("🎙️ Запись", key="doctor_recorder")
-    
+
+    temp_path = "/tmp/recorded_audio.wav"
     if audio_file:
-        # Save audio temporarily
-        temp_path = "/tmp/recorded_audio.wav"
         with open(temp_path, "wb") as f:
             f.write(audio_file.getbuffer())
-        
         st.success("Запись завершена! ✓")
-        
-        # Transcribe button
-        if st.button("Транскрибировать", type="primary"):
+
+        if st.button("Транскрибировать и заполнить протокол", type="primary"):
+            api_key = resolve_openai_api_key()
+            if not api_key:
+                st.error(
+                    "Не задан **OPENAI_API_KEY**: добавьте ключ в переменные окружения "
+                    "или в Streamlit Secrets."
+                )
+                st.stop()
+
+            st.session_state.doctor_metrics_saved = False
+
             with st.spinner("Транскрибация... Это может занять несколько минут."):
                 transcriber = AudioTranscriberWithMetrics(
                     model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
                 )
                 transcription = transcriber.transcribe_audio(temp_path)
-                
-                # Save original model transcription
-                st.session_state.original_transcription = transcription
-                st.session_state.doctor_transcription = transcription
-                st.session_state.doctor_metrics_saved = False
-            
-            st.success("Готово!")
-    
-    # Show editable text area if we have transcription
-    if st.session_state.doctor_transcription:
+
+            st.session_state.original_transcription = transcription
+            st.session_state.doctor_transcript_editor = transcription
+            st.session_state.protocol_consultation_date = format_consultation_date_gmt3()
+
+            try:
+                with st.spinner("Заполнение протокола (ИИ)..."):
+                    protocol = fill_protocol_from_transcript(
+                        transcription,
+                        api_key,
+                        model=resolve_openai_model(),
+                    )
+                for _k in PROTOCOL_FIELD_KEYS:
+                    st.session_state[f"proto_{_k}"] = protocol[_k]
+                st.success("Готово. Проверьте и при необходимости отредактируйте поля протокола.")
+            except Exception as e:
+                st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
+                for _k in PROTOCOL_FIELD_KEYS:
+                    _sk = f"proto_{_k}"
+                    if _sk not in st.session_state:
+                        st.session_state[_sk] = ""
+
+    if st.session_state.original_transcription:
+        if "doctor_transcript_editor" not in st.session_state:
+            st.session_state.doctor_transcript_editor = st.session_state.original_transcription
+
         st.header("Протокол консультации")
-        
-        # Editable text area
-        edited_text = st.text_area(
-            "Редактировать текст:",
-            value=st.session_state.doctor_transcription,
-            height=200,
-            key="doctor_edit"
-        )
-        
-        # Check if doctor made edits and save metrics silently
-        if edited_text != st.session_state.original_transcription and not st.session_state.doctor_metrics_saved:
-            # Doctor edited! Calculate metrics between model and doctor
+
+        with st.expander("Транскрипт (справочно, можно исправить ошибки распознавания)"):
+            st.text_area(
+                "Транскрипт",
+                height=180,
+                key="doctor_transcript_editor",
+                label_visibility="collapsed",
+            )
+
+        edited_tr = st.session_state.get("doctor_transcript_editor", st.session_state.original_transcription)
+        if (
+            edited_tr != st.session_state.original_transcription
+            and not st.session_state.doctor_metrics_saved
+        ):
             transcriber = AudioTranscriberWithMetrics(
                 model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
             )
-            wer_results = transcriber.calculate_wer(edited_text, st.session_state.original_transcription)
-            rouge_results = transcriber.calculate_rouge(edited_text, st.session_state.original_transcription)
-            
+            wer_results = transcriber.calculate_wer(edited_tr, st.session_state.original_transcription)
+            rouge_results = transcriber.calculate_rouge(edited_tr, st.session_state.original_transcription)
             row = build_metrics_row(
                 wer_results,
                 rouge_results,
@@ -434,32 +515,40 @@ if mode == "Doctor Mode":
                         "Метрики: отправка не удалась — "
                         + (_metrics_err or "неизвестная ошибка")
                     )
-            
             st.session_state.doctor_metrics_saved = True
-        
-        # Download protocol
+
+        _labels = {
+            "complaints": "Жалобы",
+            "anamnesis": "Анамнез",
+            "conclusion": "Заключение",
+            "recommendations": "Рекомендации",
+        }
+        for _k in PROTOCOL_FIELD_KEYS:
+            st.text_area(_labels[_k], key=f"proto_{_k}", height=120)
+
+        consultation_date = st.session_state.get("protocol_consultation_date") or format_consultation_date_gmt3()
+        fields = {k: st.session_state.get(f"proto_{k}", "") for k in PROTOCOL_FIELD_KEYS}
+
         st.subheader("Скачать протокол")
-        
         col1, col2 = st.columns(2)
-        
-        # DOCX
-        doc = create_protocol_docx(edited_text)
+        meta = {"model_whisper": resolve_hub_model_id(), "model_llm": resolve_openai_model()}
+        doc = create_structured_protocol_docx(fields, consultation_date, metadata=meta)
         doc_path = "/tmp/protocol.docx"
         doc.save(doc_path)
         with open(doc_path, "rb") as f:
-            col1.download_button("📄 Скачать .docx", f.read(), "protocol.docx",
-                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            
-            # TXT
-            txt_path = "/tmp/protocol.txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(edited_text)
-            with open(txt_path, "r", encoding="utf-8") as f:
-                col2.download_button("📄 Скачать .txt", f.read(), "protocol.txt", "text/plain")
-        
-        # Cleanup
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            col1.download_button(
+                "📄 Скачать .docx",
+                f.read(),
+                "protocol.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        txt_body = build_structured_protocol_txt(fields, consultation_date)
+        col2.download_button(
+            "📄 Скачать .txt",
+            txt_body,
+            "protocol.txt",
+            "text/plain",
+        )
 
 
 # ============ DEVELOPER MODE ============
