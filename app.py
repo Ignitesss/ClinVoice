@@ -591,37 +591,78 @@ elif mode == "Developer Mode":
             st.success("Конвертация завершена! ✓")
         
         st.audio(audio_file, format=audio_file.type)
-        
+
+        for _fk in PROTOCOL_FIELD_KEYS:
+            _sk = f"dev_proto_{_fk}"
+            if _sk not in st.session_state:
+                st.session_state[_sk] = ""
+
         # Initialize session state for results
-        if 'transcription_done' not in st.session_state:
+        if "transcription_done" not in st.session_state:
             st.session_state.transcription_done = False
-        
-        if st.button("Транскрибировать", type="primary"):
+
+        if st.button("Транскрибировать и заполнить протокол", type="primary"):
+            api_key = resolve_openai_api_key()
+            if not api_key:
+                st.error(
+                    "Не задан **OPENAI_API_KEY**: добавьте ключ в переменные окружения "
+                    "или в Streamlit Secrets."
+                )
+                st.stop()
+
             with st.spinner("Транскрибация..."):
-                transcriber = AudioTranscriberWithMetrics(model_size=model_size, hub_model_id=hub_model_id)
+                transcriber = AudioTranscriberWithMetrics(
+                    model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
+                )
                 transcription = transcriber.transcribe_audio(audio_path)
-            
-            # Save to session state
+
             st.session_state.transcription = transcription
+            st.session_state.dev_transcript_editor = transcription
             st.session_state.transcription_done = True
-            
-            # Calculate metrics if reference text exists
+            st.session_state.dev_protocol_consultation_date = format_consultation_date_gmt3()
+
             if reference_text:
                 wer_results = transcriber.calculate_wer(reference_text, transcription)
                 rouge_results = transcriber.calculate_rouge(reference_text, transcription)
                 st.session_state.wer_results = wer_results
                 st.session_state.rouge_results = rouge_results
-            
-            st.success("Готово!")
-        
+            else:
+                st.session_state.pop("wer_results", None)
+                st.session_state.pop("rouge_results", None)
+
+            try:
+                with st.spinner("Заполнение протокола (ИИ)..."):
+                    protocol = fill_protocol_from_transcript(
+                        transcription,
+                        api_key,
+                        model=resolve_openai_model(),
+                    )
+                for _k in PROTOCOL_FIELD_KEYS:
+                    st.session_state[f"dev_proto_{_k}"] = protocol[_k]
+                st.success("Готово. Проверьте транскрипт, метрики и поля протокола.")
+            except Exception as e:
+                st.error(f"Ошибка заполнения протокола (OpenAI): {e}")
+                for _k in PROTOCOL_FIELD_KEYS:
+                    _sk = f"dev_proto_{_k}"
+                    if _sk not in st.session_state:
+                        st.session_state[_sk] = ""
+
         # Show results if transcription was done
         if st.session_state.transcription_done:
             transcription = st.session_state.transcription
-            
+
             # Show results
             st.header("Результаты")
-            st.text_area("Текст:", transcription, height=150, key="dev_text")
-            
+            if "dev_transcript_editor" not in st.session_state:
+                st.session_state.dev_transcript_editor = transcription
+            with st.expander("Транскрипт (справочно, можно исправить)"):
+                st.text_area(
+                    "Транскрипт",
+                    height=150,
+                    key="dev_transcript_editor",
+                    label_visibility="collapsed",
+                )
+
             # Calculate and show metrics if reference text exists
             wer_results = None
             rouge_results = None
@@ -656,10 +697,20 @@ elif mode == "Developer Mode":
                     st.markdown("**Лишние:** " + ", ".join(wer_results['extra_words']) if wer_results['extra_words'] else "нет")
             else:
                 st.info("Добавьте эталонный текст выше, чтобы увидеть метрики")
-            
+
+            _dev_labels = {
+                "complaints": "Жалобы",
+                "anamnesis": "Анамнез",
+                "conclusion": "Заключение",
+                "recommendations": "Рекомендации",
+            }
+            st.subheader("Протокол консультации (ИИ)")
+            for _k in PROTOCOL_FIELD_KEYS:
+                st.text_area(_dev_labels[_k], key=f"dev_proto_{_k}", height=120)
+
             # Downloads
-            st.subheader("Скачать отчёт")
-            
+            st.subheader("Скачать отчёт (транскрипция и метрики)")
+
             col1, col2 = st.columns(2)
             
             # TXT report
@@ -693,16 +744,58 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(txt_content)
             with open(txt_path, "r", encoding="utf-8") as f:
-                col1.download_button("Скачать отчёт (.txt)", f.read(), "report.txt", "text/plain")
-            
-            # DOCX
+                col1.download_button(
+                    "Скачать отчёт (.txt)",
+                    f.read(),
+                    "report.txt",
+                    "text/plain",
+                    key="dev_asr_report_txt",
+                )
+
+            # DOCX (legacy: один блок текста)
             doc = create_protocol_docx(transcription, {"model": model_size})
             doc_path = "/tmp/report.docx"
             doc.save(doc_path)
             with open(doc_path, "rb") as f:
-                col2.download_button("Скачать протокол (.docx)", f.read(), "report.docx",
-                                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        
+                col2.download_button(
+                    "Скачать отчёт (.docx)",
+                    f.read(),
+                    "report.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dev_asr_report_docx",
+                )
+
+            st.subheader("Скачать протокол (как у врача)")
+            dev_fields = {k: st.session_state.get(f"dev_proto_{k}", "") for k in PROTOCOL_FIELD_KEYS}
+            dev_consultation_date = (
+                st.session_state.get("dev_protocol_consultation_date") or format_consultation_date_gmt3()
+            )
+            dev_meta = {
+                "model_whisper": hub_model_id or f"openai-whisper-{model_size}",
+                "model_llm": resolve_openai_model(),
+                "mode": "Developer Mode",
+            }
+            sdoc = create_structured_protocol_docx(dev_fields, dev_consultation_date, metadata=dev_meta)
+            sdoc_path = "/tmp/dev_protocol.docx"
+            sdoc.save(sdoc_path)
+            col3, col4 = st.columns(2)
+            with open(sdoc_path, "rb") as f:
+                col3.download_button(
+                    "📄 Протокол .docx",
+                    f.read(),
+                    "protocol_dev.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dev_structured_docx",
+                )
+            dev_txt_body = build_structured_protocol_txt(dev_fields, dev_consultation_date)
+            col4.download_button(
+                "📄 Протокол .txt",
+                dev_txt_body,
+                "protocol_dev.txt",
+                "text/plain",
+                key="dev_structured_txt",
+            )
+
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
