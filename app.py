@@ -45,11 +45,6 @@ def resolve_hub_model_id() -> str:
     return DEFAULT_HF_FINETUNED_REPO
 
 
-def resolve_hf_token() -> Optional[str]:
-    t = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
-    return t or None
-
-
 def resolve_whisper_engine() -> str:
     """
     Репозиторий на HF: «transformers» (веса PyTorch / safetensors) или «faster_whisper»
@@ -70,13 +65,13 @@ def resolve_whisper_engine() -> str:
     return "transformers"
 
 
-def infer_whisper_processor_repo(hub_model_id: str, token: Optional[str]) -> str:
+def infer_whisper_processor_repo(hub_model_id: str) -> str:
     """Базовый openai/whisper-* для процессора, если в finetune-репо нет preprocessor_config.json / tokenizer."""
     explicit = (os.environ.get("CLINVOICE_WHISPER_BASE_REPO") or "").strip()
     if explicit:
         return explicit
     try:
-        cfg = AutoConfig.from_pretrained(hub_model_id, token=token)
+        cfg = AutoConfig.from_pretrained(hub_model_id)
         cand = getattr(cfg, "_name_or_path", None) or getattr(cfg, "name_or_path", None)
         if cand:
             s = str(cand).strip()
@@ -122,7 +117,6 @@ class AudioTranscriberWithMetrics:
     ):
         """Whisper: openai-whisper, HF (PyTorch/transformers) или HF (CTranslate2 / faster-whisper)."""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        token = resolve_hf_token()
         engine = resolve_whisper_engine() if hub_model_id else "openai"
         safe_hub = (hub_model_id or "").replace("/", "_")
         cache_key = f"asr_{engine}_{model_size}_{safe_hub or 'openai_whisper'}"
@@ -143,14 +137,12 @@ class AudioTranscriberWithMetrics:
                     )
                 device_kw = "cuda" if self.device.type == "cuda" else "cpu"
                 compute_type = "float16" if device_kw == "cuda" else "int8"
-                fw_kwargs = {
-                    "device": device_kw,
-                    "compute_type": compute_type,
-                }
-                if token:
-                    fw_kwargs["use_auth_token"] = token
                 try:
-                    self.faster_model = WhisperModel(hub_model_id, **fw_kwargs)
+                    self.faster_model = WhisperModel(
+                        hub_model_id,
+                        device=device_kw,
+                        compute_type=compute_type,
+                    )
                 except Exception as e:
                     st.error(f"Ошибка загрузки модели с Hub: {e}")
                     st.stop()
@@ -171,15 +163,14 @@ class AudioTranscriberWithMetrics:
                         f"(первый запуск может занять несколько минут)..."
                     )
                 try:
-                    kwargs = {"torch_dtype": torch.float32}
-                    if token:
-                        kwargs["token"] = token
-                    self.model = WhisperForConditionalGeneration.from_pretrained(hub_model_id, **kwargs)
-                    proc_kwargs = {"token": token} if token else {}
+                    self.model = WhisperForConditionalGeneration.from_pretrained(
+                        hub_model_id,
+                        torch_dtype=torch.float32,
+                    )
                     try:
-                        self.processor = WhisperProcessor.from_pretrained(hub_model_id, **proc_kwargs)
+                        self.processor = WhisperProcessor.from_pretrained(hub_model_id)
                     except Exception:
-                        base_proc = infer_whisper_processor_repo(hub_model_id, token)
+                        base_proc = infer_whisper_processor_repo(hub_model_id)
                         if not silent_ui:
                             st.warning(
                                 f"В репозитории «{hub_model_id}» нет полного процессора "
@@ -188,7 +179,7 @@ class AudioTranscriberWithMetrics:
                                 f"Если размер не совпадает с дообучением, задайте переменную **CLINVOICE_WHISPER_BASE_REPO** "
                                 f"(например, `openai/whisper-base`)."
                             )
-                        self.processor = WhisperProcessor.from_pretrained(base_proc, **proc_kwargs)
+                        self.processor = WhisperProcessor.from_pretrained(base_proc)
                     self.feature_extractor = self.processor.feature_extractor
                     self.tokenizer = self.processor.tokenizer
                     self.use_transformers = True
