@@ -47,22 +47,26 @@ def resolve_hub_model_id() -> str:
 
 def resolve_whisper_engine() -> str:
     """
-    Репозиторий на HF: «transformers» (веса PyTorch / safetensors) или «faster_whisper»
-    (CTranslate2: model.bin, как в папке whisper-ct2). Задаётся CLINVOICE_WHISPER_ENGINE
-    в env или Streamlit Secrets: faster_whisper | ct2 | ctranslate2 (регистр не важен).
-    По умолчанию — transformers.
+    Репозиторий на HF: «faster_whisper» (CTranslate2: model.bin) или «transformers»
+    (PyTorch: model.safetensors / pytorch_model.bin). Задаётся CLINVOICE_WHISPER_ENGINE
+    в env или Streamlit Secrets. По умолчанию — faster_whisper (репозиторий по умолчанию
+    в формате CT2). Для старых репо только с PyTorch укажите: transformers | pytorch | hf.
     """
     raw = (os.environ.get("CLINVOICE_WHISPER_ENGINE") or "").strip().lower()
+    if raw in ("transformers", "pytorch", "hf", "huggingface"):
+        return "transformers"
     if raw in ("faster_whisper", "faster-whisper", "ct2", "ctranslate2"):
         return "faster_whisper"
     try:
         if hasattr(st, "secrets") and "CLINVOICE_WHISPER_ENGINE" in st.secrets:
             v = str(st.secrets["CLINVOICE_WHISPER_ENGINE"]).strip().lower()
+            if v in ("transformers", "pytorch", "hf", "huggingface"):
+                return "transformers"
             if v in ("faster_whisper", "faster-whisper", "ct2", "ctranslate2"):
                 return "faster_whisper"
     except Exception:
         pass
-    return "transformers"
+    return "faster_whisper"
 
 
 def infer_whisper_processor_repo(hub_model_id: str) -> str:
