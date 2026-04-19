@@ -15,12 +15,6 @@ from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from metrics_sheets import (
-    build_metrics_row,
-    metrics_sheets_secrets_configured,
-    submit_metrics_row_to_sheets,
-)
-
 from protocol import (
     PROTOCOL_FIELD_KEYS,
     fill_protocol_from_transcript,
@@ -54,6 +48,26 @@ def resolve_hub_model_id() -> str:
 def resolve_hf_token() -> Optional[str]:
     t = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
     return t or None
+
+
+def resolve_whisper_engine() -> str:
+    """
+    Репозиторий на HF: «transformers» (веса PyTorch / safetensors) или «faster_whisper»
+    (CTranslate2: model.bin, как в папке whisper-ct2). Задаётся CLINVOICE_WHISPER_ENGINE
+    в env или Streamlit Secrets: faster_whisper | ct2 | ctranslate2 (регистр не важен).
+    По умолчанию — transformers.
+    """
+    raw = (os.environ.get("CLINVOICE_WHISPER_ENGINE") or "").strip().lower()
+    if raw in ("faster_whisper", "faster-whisper", "ct2", "ctranslate2"):
+        return "faster_whisper"
+    try:
+        if hasattr(st, "secrets") and "CLINVOICE_WHISPER_ENGINE" in st.secrets:
+            v = str(st.secrets["CLINVOICE_WHISPER_ENGINE"]).strip().lower()
+            if v in ("faster_whisper", "faster-whisper", "ct2", "ctranslate2"):
+                return "faster_whisper"
+    except Exception:
+        pass
+    return "transformers"
 
 
 def infer_whisper_processor_repo(hub_model_id: str, token: Optional[str]) -> str:
@@ -106,19 +120,54 @@ class AudioTranscriberWithMetrics:
         *,
         silent_ui: bool = False,
     ):
-        """Whisper: либо базовая openai-whisper (hub_model_id=None), либо дообученная с Hugging Face Hub."""
+        """Whisper: openai-whisper, HF (PyTorch/transformers) или HF (CTranslate2 / faster-whisper)."""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         token = resolve_hf_token()
+        engine = resolve_whisper_engine() if hub_model_id else "openai"
         safe_hub = (hub_model_id or "").replace("/", "_")
-        cache_key = f"asr_{model_size}_{safe_hub or 'openai_whisper'}"
+        cache_key = f"asr_{engine}_{model_size}_{safe_hub or 'openai_whisper'}"
+        self.use_faster_whisper = False
+        self.use_transformers = False
+
         if cache_key not in st.session_state:
-            if hub_model_id:
-                if not TRANSFORMERS_AVAILABLE:
-                    st.error("Пакет transformers необходим для дообученной модели с Hub.")
+            if hub_model_id and engine == "faster_whisper":
+                try:
+                    from faster_whisper import WhisperModel
+                except ImportError:
+                    st.error("Нужен пакет faster-whisper. Выполните: pip install -r requirements.txt")
                     st.stop()
                 if not silent_ui:
                     st.info(
-                        f"Загрузка дообученной модели с Hugging Face: {hub_model_id} "
+                        f"Загрузка модели (формат CTranslate2) с Hugging Face: {hub_model_id} "
+                        f"(первый запуск может занять несколько минут)..."
+                    )
+                device_kw = "cuda" if self.device.type == "cuda" else "cpu"
+                compute_type = "float16" if device_kw == "cuda" else "int8"
+                fw_kwargs = {
+                    "device": device_kw,
+                    "compute_type": compute_type,
+                }
+                if token:
+                    fw_kwargs["use_auth_token"] = token
+                try:
+                    self.faster_model = WhisperModel(hub_model_id, **fw_kwargs)
+                except Exception as e:
+                    st.error(f"Ошибка загрузки модели с Hub: {e}")
+                    st.stop()
+                self.use_faster_whisper = True
+                self.use_transformers = False
+                st.session_state[cache_key] = {
+                    "faster_model": self.faster_model,
+                    "use_transformers": False,
+                    "use_faster_whisper": True,
+                }
+            elif hub_model_id:
+                if not TRANSFORMERS_AVAILABLE:
+                    st.error("Пакет transformers необходим для дообученной модели с Hub (режим PyTorch).")
+                    st.stop()
+                if not silent_ui:
+                    st.info(
+                        f"Загрузка дообученной модели (PyTorch) с Hugging Face: {hub_model_id} "
                         f"(первый запуск может занять несколько минут)..."
                     )
                 try:
@@ -143,14 +192,16 @@ class AudioTranscriberWithMetrics:
                     self.feature_extractor = self.processor.feature_extractor
                     self.tokenizer = self.processor.tokenizer
                     self.use_transformers = True
+                    self.use_faster_whisper = False
                     self.model.to(self.device)
                     self.model.eval()
                     st.session_state[cache_key] = {
-                        'model': self.model,
-                        'processor': self.processor,
-                        'feature_extractor': self.feature_extractor,
-                        'tokenizer': self.tokenizer,
-                        'use_transformers': True,
+                        "model": self.model,
+                        "processor": self.processor,
+                        "feature_extractor": self.feature_extractor,
+                        "tokenizer": self.tokenizer,
+                        "use_transformers": True,
+                        "use_faster_whisper": False,
                     }
                 except Exception as e:
                     st.error(f"Ошибка загрузки модели с Hub: {e}")
@@ -160,23 +211,41 @@ class AudioTranscriberWithMetrics:
                     st.info(f"Загрузка базовой модели Whisper ({model_size})...")
                 self.model = whisper.load_model(model_size)
                 self.use_transformers = False
-                st.session_state[cache_key] = {'model': self.model, 'use_transformers': False}
+                self.use_faster_whisper = False
+                st.session_state[cache_key] = {
+                    "model": self.model,
+                    "use_transformers": False,
+                    "use_faster_whisper": False,
+                }
         else:
-            # Load from cache
             cached = st.session_state[cache_key]
-            self.model = cached['model']
-            self.use_transformers = cached.get('use_transformers', False)
-            if self.use_transformers:
-                self.processor = cached['processor']
-                self.feature_extractor = cached['feature_extractor']
-                self.tokenizer = cached['tokenizer']
+            self.use_faster_whisper = cached.get("use_faster_whisper", False)
+            self.use_transformers = cached.get("use_transformers", False)
+            if self.use_faster_whisper:
+                self.faster_model = cached["faster_model"]
+            elif self.use_transformers:
+                self.model = cached["model"]
+                self.processor = cached["processor"]
+                self.feature_extractor = cached["feature_extractor"]
+                self.tokenizer = cached["tokenizer"]
                 self.model.to(self.device)
                 self.model.eval()
-        
+            else:
+                self.model = cached["model"]
+
         self.rouge = Rouge()
 
     def transcribe_audio(self, audio_path, language='ru'):
         """Транскрибация аудиофайла"""
+        if getattr(self, "use_faster_whisper", False):
+            segments, _info = self.faster_model.transcribe(
+                audio_path,
+                language=language,
+                beam_size=5,
+                vad_filter=False,
+            )
+            return "".join(seg.text for seg in segments).strip()
+
         if self.use_transformers:
             # Use Transformers for fine-tuned model
             import librosa
@@ -359,7 +428,6 @@ st.markdown("**Распознавание речи для медицинских
 # Check URL for dev mode
 query_params = st.query_params
 is_dev_mode = query_params.get("mode") == "dev"
-metrics_debug = query_params.get("metrics_debug") == "1"
 
 # Show sidebar only in dev mode
 if is_dev_mode:
@@ -404,11 +472,6 @@ else:
 # ============ DOCTOR MODE ============
 if mode == "Doctor Mode":
     st.header("Запись консультации")
-    if metrics_debug and not metrics_sheets_secrets_configured():
-        st.info(
-            "Отладка метрик (`metrics_debug=1`): не заданы `CLINVOICE_SHEETS_WEBAPP_URL` "
-            "или `CLINVOICE_SHEETS_SECRET` в Secrets / окружении."
-        )
     st.warning(
         "При первом запуске загрузка и настройка приложения могут занять несколько минут — это нормально."
     )
@@ -417,8 +480,6 @@ if mode == "Doctor Mode":
     # Initialize session state
     if "original_transcription" not in st.session_state:
         st.session_state.original_transcription = None
-    if "doctor_metrics_saved" not in st.session_state:
-        st.session_state.doctor_metrics_saved = False
     if "protocol_editor_text" not in st.session_state:
         st.session_state.protocol_editor_text = ""
 
@@ -438,8 +499,6 @@ if mode == "Doctor Mode":
                     "в переменных окружения или в секретах приложения."
                 )
                 st.stop()
-
-            st.session_state.doctor_metrics_saved = False
 
             with st.spinner("Транскрибация... Это может занять несколько минут."):
                 transcriber = AudioTranscriberWithMetrics(
@@ -479,32 +538,6 @@ if mode == "Doctor Mode":
                 key="doctor_transcript_editor",
                 label_visibility="collapsed",
             )
-
-        edited_tr = st.session_state.get("doctor_transcript_editor", st.session_state.original_transcription)
-        if (
-            edited_tr != st.session_state.original_transcription
-            and not st.session_state.doctor_metrics_saved
-        ):
-            transcriber = AudioTranscriberWithMetrics(
-                model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
-            )
-            wer_results = transcriber.calculate_wer(edited_tr, st.session_state.original_transcription)
-            rouge_results = transcriber.calculate_rouge(edited_tr, st.session_state.original_transcription)
-            row = build_metrics_row(
-                wer_results,
-                rouge_results,
-                resolve_hub_model_id(),
-            )
-            _ok, _metrics_err = submit_metrics_row_to_sheets(row)
-            if metrics_debug:
-                if _ok:
-                    st.success("Метрики: отправка успешна (режим отладки `metrics_debug=1`).")
-                else:
-                    st.warning(
-                        "Метрики: отправка не удалась — "
-                        + (_metrics_err or "неизвестная ошибка")
-                    )
-            st.session_state.doctor_metrics_saved = True
 
         st.text_area(
             "Протокол (редактирование)",
