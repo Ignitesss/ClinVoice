@@ -1,15 +1,57 @@
 # -*- coding: utf-8 -*-
 """
 ClinVoice - Medical Speech Recognition App
-Full version with AudioTranscriber, WhisperFineTuner, and ModelComparator
+Full version with AudioTranscriber and WhisperFineTuner
 """
 
+import os
 import streamlit as st
+
+
+def resolve_app_cache_root() -> str:
+    """Корень кэша артефактов: env CLINVOICE_CACHE_DIR, секрет Streamlit, или ~/.cache/clinvoice."""
+    root = (os.environ.get("CLINVOICE_CACHE_DIR") or "").strip()
+    if not root:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_CACHE_DIR" in st.secrets:
+                root = str(st.secrets["CLINVOICE_CACHE_DIR"]).strip()
+        except Exception:
+            pass
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".cache", "clinvoice")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def apply_disk_cache_layout(cache_root: str) -> None:
+    """
+    Свести загрузки к одному дереву (меньше разброса по ~/.cache).
+    Hugging Face: HF_HOME / HF_HUB_CACHE; openai-whisper — отдельная подпапка (load_model).
+    """
+    hf_default = os.path.join(cache_root, "huggingface")
+    openai_dir = os.path.join(cache_root, "openai-whisper")
+    torch_dir = os.path.join(cache_root, "torch")
+    for d in (hf_default, openai_dir, torch_dir):
+        os.makedirs(d, exist_ok=True)
+    os.environ.setdefault("HF_HOME", hf_default)
+    hf_home = os.environ["HF_HOME"]
+    os.makedirs(hf_home, exist_ok=True)
+    hub = os.path.join(hf_home, "hub")
+    os.environ.setdefault("HF_HUB_CACHE", hub)
+    os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
+    os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(hf_home, "transformers"))
+    os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
+    os.environ.setdefault("TORCH_HOME", torch_dir)
+    os.environ["_CLINVOICE_OPENAI_WHISPER_DIR"] = openai_dir
+
+
+_APP_CACHE_ROOT = resolve_app_cache_root()
+apply_disk_cache_layout(_APP_CACHE_ROOT)
+
 import whisper
 import jiwer
 from rouge import Rouge
 from docx import Document
-import os
 import torch
 from datetime import datetime
 from typing import Optional
@@ -86,6 +128,107 @@ def infer_whisper_processor_repo(hub_model_id: str) -> str:
     return "openai/whisper-small"
 
 
+def openai_whisper_download_dir() -> str:
+    return os.environ.get("_CLINVOICE_OPENAI_WHISPER_DIR") or os.path.join(
+        _APP_CACHE_ROOT, "openai-whisper"
+    )
+
+
+def hf_hub_download_dir() -> str:
+    return os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.join(_APP_CACHE_ROOT, "huggingface")),
+        "hub",
+    )
+
+
+def get_session_rouge() -> Rouge:
+    if "_clinvoice_rouge" not in st.session_state:
+        st.session_state["_clinvoice_rouge"] = Rouge()
+    return st.session_state["_clinvoice_rouge"]
+
+
+_WER_TRANSFORMATION = jiwer.Compose(
+    [
+        jiwer.ToLowerCase(),
+        jiwer.RemoveWhiteSpace(replace_by_space=True),
+        jiwer.RemoveMultipleSpaces(),
+        jiwer.Strip(),
+        jiwer.RemovePunctuation(),
+        jiwer.ReduceToListOfListOfWords(),
+    ]
+)
+
+
+def compute_wer_metrics(reference: str, hypothesis: str) -> dict:
+    """WER и связанные счётчики (без загрузки ASR-модели)."""
+    wer_score = jiwer.wer(
+        reference,
+        hypothesis,
+        reference_transform=_WER_TRANSFORMATION,
+        hypothesis_transform=_WER_TRANSFORMATION,
+    )
+    ref_words = reference.lower().split()
+    hyp_words = hypothesis.lower().split()
+    common_words = set(ref_words) & set(hyp_words)
+    missing_words = set(ref_words) - set(hyp_words)
+    extra_words = set(hyp_words) - set(ref_words)
+    return {
+        "wer": wer_score,
+        "wer_percentage": wer_score * 100,
+        "word_accuracy": 1 - wer_score,
+        "total_ref_words": len(ref_words),
+        "total_hyp_words": len(hyp_words),
+        "common_words": common_words,
+        "missing_words": missing_words,
+        "extra_words": extra_words,
+    }
+
+
+def compute_rouge_metrics(reference: str, hypothesis: str, rouge: Rouge):
+    try:
+        scores = rouge.get_scores(hypothesis, reference)[0]
+        return {
+            "rouge-1": {
+                "f": scores["rouge-1"]["f"] * 100,
+                "p": scores["rouge-1"]["p"] * 100,
+                "r": scores["rouge-1"]["r"] * 100,
+            },
+            "rouge-2": {
+                "f": scores["rouge-2"]["f"] * 100,
+                "p": scores["rouge-2"]["p"] * 100,
+                "r": scores["rouge-2"]["r"] * 100,
+            },
+            "rouge-l": {
+                "f": scores["rouge-l"]["f"] * 100,
+                "p": scores["rouge-l"]["p"] * 100,
+                "r": scores["rouge-l"]["r"] * 100,
+            },
+        }
+    except Exception as e:
+        st.error(f"Ошибка при расчете ROUGE: {e}")
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _load_faster_whisper_cached(repo_id: str, device_kw: str, compute_type: str):
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(
+        repo_id,
+        device=device_kw,
+        compute_type=compute_type,
+        download_root=hf_hub_download_dir(),
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _load_openai_whisper_cached(model_size: str):
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    return whisper.load_model(
+        model_size, device=dev, download_root=openai_whisper_download_dir()
+    )
+
+
 # Page config
 st.set_page_config(
     page_title="ClinVoice",
@@ -123,56 +266,47 @@ class AudioTranscriberWithMetrics:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         engine = resolve_whisper_engine() if hub_model_id else "openai"
         safe_hub = (hub_model_id or "").replace("/", "_")
-        cache_key = f"asr_{engine}_{model_size}_{safe_hub or 'openai_whisper'}"
+        transformers_cache_key = f"asr_transformers_{model_size}_{safe_hub or 'openai_whisper'}"
         self.use_faster_whisper = False
         self.use_transformers = False
 
-        if cache_key not in st.session_state:
-            if hub_model_id and engine == "faster_whisper":
-                try:
-                    from faster_whisper import WhisperModel
-                except ImportError:
-                    st.error("Нужен пакет faster-whisper. Выполните: pip install -r requirements.txt")
-                    st.stop()
-                if not silent_ui:
-                    st.info(
-                        f"Загрузка модели (формат CTranslate2) с Hugging Face: {hub_model_id} "
-                        f"(первый запуск может занять несколько минут)..."
-                    )
-                device_kw = "cuda" if self.device.type == "cuda" else "cpu"
-                compute_type = "float16" if device_kw == "cuda" else "int8"
-                try:
-                    self.faster_model = WhisperModel(
-                        hub_model_id,
-                        device=device_kw,
-                        compute_type=compute_type,
-                    )
-                except Exception as e:
-                    st.error(f"Ошибка загрузки модели с Hub: {e}")
-                    st.stop()
-                self.use_faster_whisper = True
-                self.use_transformers = False
-                st.session_state[cache_key] = {
-                    "faster_model": self.faster_model,
-                    "use_transformers": False,
-                    "use_faster_whisper": True,
-                }
-            elif hub_model_id:
-                if not TRANSFORMERS_AVAILABLE:
-                    st.error("Пакет transformers необходим для дообученной модели с Hub (режим PyTorch).")
-                    st.stop()
+        if hub_model_id and engine == "faster_whisper":
+            if not silent_ui:
+                st.info(
+                    f"Загрузка модели (формат CTranslate2) с Hugging Face: {hub_model_id} "
+                    f"(первый запуск может занять несколько минут)..."
+                )
+            device_kw = "cuda" if self.device.type == "cuda" else "cpu"
+            compute_type = "float16" if device_kw == "cuda" else "int8"
+            try:
+                self.faster_model = _load_faster_whisper_cached(
+                    hub_model_id, device_kw, compute_type
+                )
+            except ImportError:
+                st.error("Нужен пакет faster-whisper. Выполните: pip install -r requirements.txt")
+                st.stop()
+            except Exception as e:
+                st.error(f"Ошибка загрузки модели с Hub: {e}")
+                st.stop()
+            self.use_faster_whisper = True
+            self.use_transformers = False
+        elif hub_model_id:
+            if not TRANSFORMERS_AVAILABLE:
+                st.error("Пакет transformers необходим для дообученной модели с Hub (режим PyTorch).")
+                st.stop()
+            if transformers_cache_key not in st.session_state:
                 if not silent_ui:
                     st.info(
                         f"Загрузка дообученной модели (PyTorch) с Hugging Face: {hub_model_id} "
                         f"(первый запуск может занять несколько минут)..."
                     )
                 try:
-                    self.model = WhisperForConditionalGeneration.from_pretrained(
+                    model = WhisperForConditionalGeneration.from_pretrained(
                         hub_model_id,
                         torch_dtype=torch.float32,
                     )
                     try:
-                        self.processor = WhisperProcessor.from_pretrained(hub_model_id)
+                        processor = WhisperProcessor.from_pretrained(hub_model_id)
                     except Exception:
                         base_proc = infer_whisper_processor_repo(hub_model_id)
                         if not silent_ui:
@@ -183,52 +317,33 @@ class AudioTranscriberWithMetrics:
                                 f"Если размер не совпадает с дообучением, задайте переменную **CLINVOICE_WHISPER_BASE_REPO** "
                                 f"(например, `openai/whisper-base`)."
                             )
-                        self.processor = WhisperProcessor.from_pretrained(base_proc)
-                    self.feature_extractor = self.processor.feature_extractor
-                    self.tokenizer = self.processor.tokenizer
-                    self.use_transformers = True
-                    self.use_faster_whisper = False
-                    self.model.to(self.device)
-                    self.model.eval()
-                    st.session_state[cache_key] = {
-                        "model": self.model,
-                        "processor": self.processor,
-                        "feature_extractor": self.feature_extractor,
-                        "tokenizer": self.tokenizer,
-                        "use_transformers": True,
-                        "use_faster_whisper": False,
+                        processor = WhisperProcessor.from_pretrained(base_proc)
+                    st.session_state[transformers_cache_key] = {
+                        "model": model,
+                        "processor": processor,
+                        "feature_extractor": processor.feature_extractor,
+                        "tokenizer": processor.tokenizer,
                     }
                 except Exception as e:
                     st.error(f"Ошибка загрузки модели с Hub: {e}")
                     st.stop()
-            else:
-                if not silent_ui:
-                    st.info(f"Загрузка базовой модели Whisper ({model_size})...")
-                self.model = whisper.load_model(model_size)
-                self.use_transformers = False
-                self.use_faster_whisper = False
-                st.session_state[cache_key] = {
-                    "model": self.model,
-                    "use_transformers": False,
-                    "use_faster_whisper": False,
-                }
+            cached = st.session_state[transformers_cache_key]
+            self.model = cached["model"]
+            self.processor = cached["processor"]
+            self.feature_extractor = cached["feature_extractor"]
+            self.tokenizer = cached["tokenizer"]
+            self.use_transformers = True
+            self.use_faster_whisper = False
+            self.model.to(self.device)
+            self.model.eval()
         else:
-            cached = st.session_state[cache_key]
-            self.use_faster_whisper = cached.get("use_faster_whisper", False)
-            self.use_transformers = cached.get("use_transformers", False)
-            if self.use_faster_whisper:
-                self.faster_model = cached["faster_model"]
-            elif self.use_transformers:
-                self.model = cached["model"]
-                self.processor = cached["processor"]
-                self.feature_extractor = cached["feature_extractor"]
-                self.tokenizer = cached["tokenizer"]
-                self.model.to(self.device)
-                self.model.eval()
-            else:
-                self.model = cached["model"]
+            if not silent_ui:
+                st.info(f"Загрузка базовой модели Whisper ({model_size})...")
+            self.model = _load_openai_whisper_cached(model_size)
+            self.use_transformers = False
+            self.use_faster_whisper = False
 
-        self.rouge = Rouge()
+        self.rouge = get_session_rouge()
 
     def transcribe_audio(self, audio_path, language='ru'):
         """Транскрибация аудиофайла"""
@@ -264,51 +379,11 @@ class AudioTranscriberWithMetrics:
 
     def calculate_wer(self, reference, hypothesis):
         """Вычисляет метрики WER и связанные метрики"""
-        transformation = jiwer.Compose([
-            jiwer.ToLowerCase(),
-            jiwer.RemoveWhiteSpace(replace_by_space=True),
-            jiwer.RemoveMultipleSpaces(),
-            jiwer.Strip(),
-            jiwer.RemovePunctuation(),
-            jiwer.ReduceToListOfListOfWords()
-        ])
-        
-        wer_score = jiwer.wer(
-            reference, hypothesis,
-            reference_transform=transformation,
-            hypothesis_transform=transformation
-        )
-        
-        ref_words = reference.lower().split()
-        hyp_words = hypothesis.lower().split()
-        
-        common_words = set(ref_words) & set(hyp_words)
-        missing_words = set(ref_words) - set(hyp_words)
-        extra_words = set(hyp_words) - set(ref_words)
-        
-        return {
-            "wer": wer_score,
-            "wer_percentage": wer_score * 100,
-            "word_accuracy": 1 - wer_score,
-            "total_ref_words": len(ref_words),
-            "total_hyp_words": len(hyp_words),
-            "common_words": common_words,
-            "missing_words": missing_words,
-            "extra_words": extra_words
-        }
+        return compute_wer_metrics(reference, hypothesis)
 
     def calculate_rouge(self, reference, hypothesis):
         """Расчет ROUGE метрик"""
-        try:
-            scores = self.rouge.get_scores(hypothesis, reference)[0]
-            return {
-                'rouge-1': {'f': scores['rouge-1']['f'] * 100, 'p': scores['rouge-1']['p'] * 100, 'r': scores['rouge-1']['r'] * 100},
-                'rouge-2': {'f': scores['rouge-2']['f'] * 100, 'p': scores['rouge-2']['p'] * 100, 'r': scores['rouge-2']['r'] * 100},
-                'rouge-l': {'f': scores['rouge-l']['f'] * 100, 'p': scores['rouge-l']['p'] * 100, 'r': scores['rouge-l']['r'] * 100}
-            }
-        except Exception as e:
-            st.error(f"Ошибка при расчете ROUGE: {e}")
-            return None
+        return compute_rouge_metrics(reference, hypothesis, self.rouge)
 
     def evaluate_transcription(self, audio_path, reference_text=None):
         """Полная оценка транскрибации"""
@@ -322,41 +397,6 @@ class AudioTranscriberWithMetrics:
             result['rouge'] = rouge_results
         
         return result
-
-
-class ModelComparator:
-    """Класс для сравнения двух моделей"""
-    
-    def __init__(self, model1: AudioTranscriberWithMetrics, model2: AudioTranscriberWithMetrics,
-                 model1_name: str = "Базовая модель", model2_name: str = "Дообученная модель"):
-        self.model1 = model1
-        self.model2 = model2
-        self.model1_name = model1_name
-        self.model2_name = model2_name
-
-    def compare_on_file(self, audio_path: str, reference_text: str):
-        """Сравнение двух моделей на одном аудиофайле"""
-        st.subheader(f"--- {self.model1_name} ---")
-        result1 = self.model1.evaluate_transcription(audio_path, reference_text)
-        
-        st.subheader(f"--- {self.model2_name} ---")
-        result2 = self.model2.evaluate_transcription(audio_path, reference_text)
-        
-        # Сравнение WER
-        if 'wer' in result1 and 'wer' in result2:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(f"WER {self.model1_name}", f"{result1['wer']['wer_percentage']:.2f}%")
-            with col2:
-                st.metric(f"WER {self.model2_name}", f"{result2['wer']['wer_percentage']:.2f}%")
-            
-            wer_diff = result2['wer']['wer_percentage'] - result1['wer']['wer_percentage']
-            if wer_diff < 0:
-                st.success(f"{self.model2_name} лучше на {abs(wer_diff):.2f}%")
-            elif wer_diff > 0:
-                st.success(f"{self.model1_name} лучше на {abs(wer_diff):.2f}%")
-        
-        return {'model1': result1, 'model2': result2}
 
 
 # ============ DOCX / TXT GENERATION ============
@@ -406,7 +446,7 @@ def build_structured_protocol_txt(fields: dict, consultation_date: str) -> str:
 
 
 def create_protocol_docx(transcription):
-    """Legacy: один блок «текст консультации» (Developer / сравнение моделей)."""
+    """Legacy: один блок «текст консультации» (режим разработчика)."""
     doc = Document()
     doc.add_heading("Протокол консультации", 0)
     doc.add_paragraph(f"Дата: {format_consultation_date_gmt3()}")
@@ -429,8 +469,7 @@ if is_dev_mode:
     # Sidebar - Mode selection
     st.sidebar.title("Настройки")
     
-    mode = st.sidebar.radio("Режим:", 
-        ["Doctor Mode", "Developer Mode", "Model Comparison"])
+    mode = st.sidebar.radio("Режим:", ["Doctor Mode", "Developer Mode"])
     
     st.sidebar.markdown("---")
     
@@ -684,9 +723,12 @@ elif mode == "Developer Mode":
             if reference_text:
                 if 'wer_results' not in st.session_state:
                     with st.spinner("Расчёт метрик..."):
-                        transcriber = AudioTranscriberWithMetrics(model_size=model_size, hub_model_id=hub_model_id)
-                        st.session_state.wer_results = transcriber.calculate_wer(reference_text, transcription)
-                        st.session_state.rouge_results = transcriber.calculate_rouge(reference_text, transcription)
+                        st.session_state.wer_results = compute_wer_metrics(
+                            reference_text, transcription
+                        )
+                        st.session_state.rouge_results = compute_rouge_metrics(
+                            reference_text, transcription, get_session_rouge()
+                        )
                 
                 wer_results = st.session_state.wer_results
                 rouge_results = st.session_state.rouge_results
@@ -808,129 +850,6 @@ ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['
                 key="dev_structured_txt",
             )
 
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-
-
-# ============ MODEL COMPARISON MODE ============
-elif mode == "Model Comparison":
-    st.header("Сравнение моделей")
-    
-    # Model 1 selection
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Модель 1")
-        model1_source = st.radio("Источник:", ["HuggingFace", "Дообученная (мед., HF)"], key="m1_src")
-        if model1_source == "Дообученная (мед., HF)":
-            model1_hub_id = resolve_hub_model_id()
-            model1_size = "small"
-        else:
-            model1_hub_id = None
-            model1_size = st.selectbox("Размер:", ["tiny", "base", "small", "medium", "large"], index=1, key="m1_sz")
-    
-    with col2:
-        st.subheader("Модель 2")
-        model2_source = st.radio("Источник:", ["HuggingFace", "Дообученная (мед., HF)"], key="m2_src")
-        if model2_source == "Дообученная (мед., HF)":
-            model2_hub_id = resolve_hub_model_id()
-            model2_size = "small"
-        else:
-            model2_hub_id = None
-            model2_size = st.selectbox("Размер:", ["tiny", "base", "small", "medium", "large"], index=4, key="m2_sz")
-    
-    st.subheader("Загрузка аудио")
-    audio_file = st.file_uploader("Выберите аудиофайл (только WAV)", type=['wav'])
-    
-    # Initialize session state for comparison
-    if 'comparison_done' not in st.session_state:
-        st.session_state.comparison_done = False
-    
-    if audio_file:
-        temp_path = f"/tmp/{audio_file.name}"
-        with open(temp_path, "wb") as f:
-            f.write(audio_file.getbuffer())
-        
-        # Check if conversion is needed
-        if audio_file.name.lower().endswith('.wav'):
-            audio_path = temp_path
-            st.info("Формат: WAV ✓")
-        else:
-            st.warning("Конвертация в WAV...")
-            wav_path = temp_path.rsplit('.', 1)[0] + '.wav'
-            audio_path = convert_to_wav(temp_path, wav_path)
-            st.success("Конвертация завершена! ✓")
-        
-        st.audio(audio_file, format=audio_file.type)
-        
-        # Reference text
-        ref_option = st.radio("Эталонный текст:", ["Ввести вручную", "Загрузить .txt файл"], horizontal=True, key="ref_comp")
-        
-        reference_text = ""
-        
-        if ref_option == "Ввести вручную":
-            reference_text = st.text_area("Эталонный текст:", height=100)
-        else:
-            ref_file = st.file_uploader("Загрузите файл с эталонным текстом:", type=['txt'], key="ref_file_comp")
-            if ref_file:
-                reference_text = str(ref_file.read(), 'utf-8')
-                st.success("Файл загружен!")
-        
-        if st.button("Сравнить модели", type="primary"):
-            with st.spinner("Запуск сравнения..."):
-                model1 = AudioTranscriberWithMetrics(model_size=model1_size, hub_model_id=model1_hub_id)
-                model2 = AudioTranscriberWithMetrics(model_size=model2_size, hub_model_id=model2_hub_id)
-                
-                model1_name = f"Модель 1 ({model1_source})"
-                model2_name = f"Модель 2 ({model2_source})"
-                
-                comparator = ModelComparator(
-                    model1, model2,
-                    model1_name,
-                    model2_name
-                )
-                
-                results = comparator.compare_on_file(audio_path, reference_text)
-                
-                # Save to session state
-                st.session_state.comparison_done = True
-                st.session_state.comparison_results = results
-                st.session_state.model1_name = model1_name
-                st.session_state.model2_name = model2_name
-        
-        # Show results and download buttons if comparison was done
-        if st.session_state.comparison_done and 'comparison_results' in st.session_state:
-            results = st.session_state.comparison_results
-            model1_name = st.session_state.model1_name
-            model2_name = st.session_state.model2_name
-            
-            # Add download buttons
-            if results and reference_text:
-                st.subheader("Скачать отчёт")
-                
-                result1 = results['model1']
-                result2 = results['model2']
-                
-                txt_content = f"""ОТЧЁТ ПО СРАВНЕНИЮ МОДЕЛЕЙ
-========================
-
-{model1_name}:
-- Текст: {result1['hypothesis']}
-- WER: {result1['wer']['wer_percentage']:.2f}%
-
-{model2_name}:
-- Текст: {result2['hypothesis']}
-- WER: {result2['wer']['wer_percentage']:.2f}%
-
-Итог: {'Модель 1 лучше' if result1['wer']['wer_percentage'] < result2['wer']['wer_percentage'] else 'Модель 2 лучше'}
-"""
-                
-                txt_path = "/tmp/comparison_report.txt"
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(txt_content)
-                with open(txt_path, "r", encoding="utf-8") as f:
-                    st.download_button("Скачать отчёт (.txt)", f.read(), "comparison_report.txt", "text/plain", key="comp_txt")
-        
         if os.path.exists(audio_path):
             os.remove(audio_path)
 

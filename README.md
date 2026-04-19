@@ -15,7 +15,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Либо просто перейдите по ссылке, чтобы попробовать наш сервис - https://clinvoice-ijy9bcmuqtja7et8q748vd.streamlit.app/
+Либо просто перейдите по ссылке, чтобы попробовать наш сервис - https://clinvoice-d6qrtxccwn8gy5zuxvnbx5.streamlit.app/
 
 ## Возможности
 
@@ -27,10 +27,6 @@ streamlit run app.py
 - WER (Word Error Rate)
 - ROUGE-1, ROUGE-2, ROUGE-L метрики
 - Детальный анализ слов (совпадающие, пропущенные, лишние)
-
-### 3. Сравнение моделей (скрыт от обычного пользователя)
-- Сравнение двух моделей Whisper
-- Разница в метриках
 
 ## Требования к системе
 
