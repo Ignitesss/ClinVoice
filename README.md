@@ -6,12 +6,6 @@
 
 ```bash
 pip install -r requirements.txt
-
-# Make sure FFmpeg is installed
-# Ubuntu: sudo apt install ffmpeg
-# macOS: brew install ffmpeg
-
-# Run the app
 streamlit run app.py
 ```
 
@@ -31,7 +25,6 @@ streamlit run app.py
 ## Требования к системе
 
 - Python 3.8+
-- FFmpeg (system)
 - ~2GB disk space for Whisper models
 
 ## Как пользоваться?

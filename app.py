@@ -236,21 +236,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# ============ AUDIO CONVERSION ============
-
-def convert_to_wav(input_path, output_path=None):
-    """Конвертирует аудио в WAV формат с помощью FFmpeg"""
-    import subprocess
-    
-    if output_path is None:
-        output_path = input_path.rsplit('.', 1)[0] + '_converted.wav'
-    
-    cmd = ['ffmpeg', '-i', input_path, '-ar', '16000', '-ac', '1', '-y', output_path]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    
-    return output_path
-
-
 # ============ CLASSES FROM YOUR COLAB ============
 
 
@@ -638,17 +623,10 @@ elif mode == "Developer Mode":
         temp_path = f"/tmp/{audio_file.name}"
         with open(temp_path, "wb") as f:
             f.write(audio_file.getbuffer())
-        
-        # Check if conversion is needed
-        if audio_file.name.lower().endswith('.wav'):
-            audio_path = temp_path
-            st.info("Формат: WAV ✓")
-        else:
-            st.warning("Конвертация в WAV...")
-            wav_path = temp_path.rsplit('.', 1)[0] + '.wav'
-            audio_path = convert_to_wav(temp_path, wav_path)
-            st.success("Конвертация завершена! ✓")
-        
+
+        audio_path = temp_path
+        st.info("Формат: WAV")
+
         st.audio(audio_file, format=audio_file.type)
 
         if "dev_protocol_editor_text" not in st.session_state:
