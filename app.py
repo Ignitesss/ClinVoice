@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ClinVoice - Medical Speech Recognition App
-Full version with AudioTranscriber and WhisperFineTuner
+ClinVoice - Medical Speech Recognition App (врачебный сценарий: запись, транскрибация, протокол).
 """
 
 import os
@@ -48,13 +47,14 @@ def apply_disk_cache_layout(cache_root: str) -> None:
 _APP_CACHE_ROOT = resolve_app_cache_root()
 apply_disk_cache_layout(_APP_CACHE_ROOT)
 
+import io
+import tempfile
+import wave
 import whisper
-import jiwer
-from rouge import Rouge
 from docx import Document
 import torch
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 from protocol import (
@@ -73,6 +73,106 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 DEFAULT_HF_FINETUNED_REPO = "Ignites/fine_tuned_med_whisper_rus"
+DEFAULT_ASR_CHUNK_SECONDS = 30.0
+
+
+def resolve_asr_chunk_seconds() -> float:
+    raw = (os.environ.get("CLINVOICE_ASR_CHUNK_SECONDS") or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        if hasattr(st, "secrets") and st.secrets and "CLINVOICE_ASR_CHUNK_SECONDS" in st.secrets:
+            v = float(str(st.secrets["CLINVOICE_ASR_CHUNK_SECONDS"]).strip())
+            if v > 0:
+                return v
+    except Exception:
+        pass
+    return DEFAULT_ASR_CHUNK_SECONDS
+
+
+def _read_wav_params(data: bytes):
+    with wave.open(io.BytesIO(data), "rb") as w:
+        nframes = w.getnframes()
+        return w.getnchannels(), w.getsampwidth(), w.getframerate(), nframes, w.readframes(nframes)
+
+
+def merge_wav_segments_to_bytes(segments: List[bytes]) -> bytes:
+    """Склеить несколько WAV с одинаковыми параметрами (mono, один sampwidth, одна частота)."""
+    if not segments:
+        raise ValueError("Нет сегментов для склейки")
+    first_ch, first_sw, first_fr, _first_nf, first_frames = _read_wav_params(segments[0])
+    if first_ch != 1:
+        raise ValueError("Ожидается моно WAV (1 канал)")
+    if first_fr != 16000:
+        raise ValueError(f"Ожидается частота 16000 Hz, получено {first_fr}")
+    all_frames = [first_frames]
+    for i, seg in enumerate(segments[1:], start=2):
+        ch, sw, fr, _nf, frames = _read_wav_params(seg)
+        if (ch, sw, fr) != (first_ch, first_sw, first_fr):
+            raise ValueError(f"Сегмент {i}: несовпадение формата WAV с первым фрагментом")
+        all_frames.append(frames)
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wout:
+        wout.setnchannels(first_ch)
+        wout.setsampwidth(first_sw)
+        wout.setframerate(first_fr)
+        for frame_chunk in all_frames:
+            wout.writeframes(frame_chunk)
+    return out.getvalue()
+
+
+def merge_wav_segments_to_file(segments: List[bytes], out_path: str) -> None:
+    data = merge_wav_segments_to_bytes(segments)
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+
+def transcribe_wav_in_chunks(transcriber: "AudioTranscriberWithMetrics", wav_path: str, language: str = "ru") -> str:
+    """Длинный WAV режется на части ≤ resolve_asr_chunk_seconds(); короткий — один вызов transcribe_audio."""
+    chunk_sec = resolve_asr_chunk_seconds()
+    with wave.open(wav_path, "rb") as w:
+        ch = w.getnchannels()
+        sw = w.getsampwidth()
+        fr = w.getframerate()
+        nframes = w.getnframes()
+        if ch != 1:
+            raise ValueError("Ожидается моно WAV")
+        frames_bytes = w.readframes(nframes)
+    duration = nframes / float(fr)
+    if duration <= chunk_sec:
+        return transcriber.transcribe_audio(wav_path, language=language)
+
+    chunk_frames = max(1, int(fr * chunk_sec))
+    parts: List[str] = []
+    offset = 0
+    while offset < nframes:
+        take = min(chunk_frames, nframes - offset)
+        start_byte = offset * ch * sw
+        end_byte = (offset + take) * ch * sw
+        chunk_data = frames_bytes[start_byte:end_byte]
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            with wave.open(tmp_path, "wb") as cw:
+                cw.setnchannels(ch)
+                cw.setsampwidth(sw)
+                cw.setframerate(fr)
+                cw.writeframes(chunk_data)
+            parts.append(transcriber.transcribe_audio(tmp_path, language=language))
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        offset += take
+    return " ".join(p.strip() for p in parts if p.strip()).strip()
 
 
 def resolve_hub_model_id() -> str:
@@ -139,74 +239,6 @@ def hf_hub_download_dir() -> str:
         os.environ.get("HF_HOME", os.path.join(_APP_CACHE_ROOT, "huggingface")),
         "hub",
     )
-
-
-def get_session_rouge() -> Rouge:
-    if "_clinvoice_rouge" not in st.session_state:
-        st.session_state["_clinvoice_rouge"] = Rouge()
-    return st.session_state["_clinvoice_rouge"]
-
-
-_WER_TRANSFORMATION = jiwer.Compose(
-    [
-        jiwer.ToLowerCase(),
-        jiwer.RemoveWhiteSpace(replace_by_space=True),
-        jiwer.RemoveMultipleSpaces(),
-        jiwer.Strip(),
-        jiwer.RemovePunctuation(),
-        jiwer.ReduceToListOfListOfWords(),
-    ]
-)
-
-
-def compute_wer_metrics(reference: str, hypothesis: str) -> dict:
-    """WER и связанные счётчики (без загрузки ASR-модели)."""
-    wer_score = jiwer.wer(
-        reference,
-        hypothesis,
-        reference_transform=_WER_TRANSFORMATION,
-        hypothesis_transform=_WER_TRANSFORMATION,
-    )
-    ref_words = reference.lower().split()
-    hyp_words = hypothesis.lower().split()
-    common_words = set(ref_words) & set(hyp_words)
-    missing_words = set(ref_words) - set(hyp_words)
-    extra_words = set(hyp_words) - set(ref_words)
-    return {
-        "wer": wer_score,
-        "wer_percentage": wer_score * 100,
-        "word_accuracy": 1 - wer_score,
-        "total_ref_words": len(ref_words),
-        "total_hyp_words": len(hyp_words),
-        "common_words": common_words,
-        "missing_words": missing_words,
-        "extra_words": extra_words,
-    }
-
-
-def compute_rouge_metrics(reference: str, hypothesis: str, rouge: Rouge):
-    try:
-        scores = rouge.get_scores(hypothesis, reference)[0]
-        return {
-            "rouge-1": {
-                "f": scores["rouge-1"]["f"] * 100,
-                "p": scores["rouge-1"]["p"] * 100,
-                "r": scores["rouge-1"]["r"] * 100,
-            },
-            "rouge-2": {
-                "f": scores["rouge-2"]["f"] * 100,
-                "p": scores["rouge-2"]["p"] * 100,
-                "r": scores["rouge-2"]["r"] * 100,
-            },
-            "rouge-l": {
-                "f": scores["rouge-l"]["f"] * 100,
-                "p": scores["rouge-l"]["p"] * 100,
-                "r": scores["rouge-l"]["r"] * 100,
-            },
-        }
-    except Exception as e:
-        st.error(f"Ошибка при расчете ROUGE: {e}")
-        return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -328,8 +360,6 @@ class AudioTranscriberWithMetrics:
             self.use_transformers = False
             self.use_faster_whisper = False
 
-        self.rouge = get_session_rouge()
-
     def transcribe_audio(self, audio_path, language='ru'):
         """Транскрибация аудиофайла"""
         if getattr(self, "use_faster_whisper", False):
@@ -361,27 +391,6 @@ class AudioTranscriberWithMetrics:
             # Use openai-whisper
             result = self.model.transcribe(audio_path, language=language)
             return result["text"]
-
-    def calculate_wer(self, reference, hypothesis):
-        """Вычисляет метрики WER и связанные метрики"""
-        return compute_wer_metrics(reference, hypothesis)
-
-    def calculate_rouge(self, reference, hypothesis):
-        """Расчет ROUGE метрик"""
-        return compute_rouge_metrics(reference, hypothesis, self.rouge)
-
-    def evaluate_transcription(self, audio_path, reference_text=None):
-        """Полная оценка транскрибации"""
-        hypothesis = self.transcribe_audio(audio_path)
-        result = {'hypothesis': hypothesis}
-        
-        if reference_text:
-            wer_results = self.calculate_wer(reference_text, hypothesis)
-            rouge_results = self.calculate_rouge(reference_text, hypothesis)
-            result['wer'] = wer_results
-            result['rouge'] = rouge_results
-        
-        return result
 
 
 # ============ DOCX / TXT GENERATION ============
@@ -430,406 +439,173 @@ def build_structured_protocol_txt(fields: dict, consultation_date: str) -> str:
     return "\n".join(parts)
 
 
-def create_protocol_docx(transcription):
-    """Legacy: один блок «текст консультации» (режим разработчика)."""
-    doc = Document()
-    doc.add_heading("Протокол консультации", 0)
-    doc.add_paragraph(f"Дата: {format_consultation_date_gmt3()}")
-    doc.add_heading("Текст консультации", level=1)
-    doc.add_paragraph(transcription)
-    return doc
-
-
 # ============ MAIN UI ============
 
 st.title("🏥 ClinVoice")
 st.markdown("**Распознавание речи для медицинских консультаций**")
 
-# Check URL for dev mode
-query_params = st.query_params
-is_dev_mode = query_params.get("mode") == "dev"
+hub_model_id = resolve_hub_model_id()
+model_size = "small"
 
-# Show sidebar only in dev mode
-if is_dev_mode:
-    # Sidebar - Mode selection
-    st.sidebar.title("Настройки")
-    
-    mode = st.sidebar.radio("Режим:", ["Doctor Mode", "Developer Mode"])
-    
-    st.sidebar.markdown("---")
-    
-    # Model selection - only show in dev modes (Doctor in dev still uses Hub fine-tuned only)
-    if mode == "Doctor Mode":
-        _hid = resolve_hub_model_id()
-        model_source = f"HF fine-tuned ({_hid})"
-        hub_model_id = _hid
-        model_size = "small"
-    else:
-        model_source = st.sidebar.radio(
-            "Источник модели:",
-            ["HuggingFace", "Дообученная (мед., HF)"],
-        )
-        if model_source == "Дообученная (мед., HF)":
-            hub_model_id = resolve_hub_model_id()
-            model_size = "small"
+st.header("Запись консультации")
+st.warning(
+    "При первом запуске загрузка и настройка приложения могут занять несколько минут — это нормально."
+)
+st.caption(
+    "Записывайте фрагменты по очереди: старт/стоп микрофона, затем «Добавить фрагмент». "
+    "Так можно делать паузы между частями консультации. Длинное аудио распознаётся по частям "
+    f"до {int(resolve_asr_chunk_seconds())} с — меньше нагрузка на память."
+)
+
+if "original_transcription" not in st.session_state:
+    st.session_state.original_transcription = None
+if "protocol_editor_text" not in st.session_state:
+    st.session_state.protocol_editor_text = ""
+if "doctor_audio_segments" not in st.session_state:
+    st.session_state.doctor_audio_segments = []
+if "doctor_recorder_nonce" not in st.session_state:
+    st.session_state.doctor_recorder_nonce = 0
+
+seg_count = len(st.session_state.doctor_audio_segments)
+st.caption(f"Сохранено фрагментов в консультации: **{seg_count}**")
+
+rec_key = f"doctor_recorder_{st.session_state.doctor_recorder_nonce}"
+audio_file = st.audio_input("🎙️ Запись фрагмента", key=rec_key, sample_rate=16000)
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    if st.button("Добавить фрагмент в консультацию"):
+        if audio_file is None:
+            st.warning("Сначала запишите фрагмент микрофоном.")
         else:
-            hub_model_id = None
-            model_size = st.sidebar.selectbox(
-                "Размер модели:",
-                ["tiny", "base", "small", "medium", "large"],
-                index=1,
+            st.session_state.doctor_audio_segments.append(bytes(audio_file.getbuffer()))
+            st.session_state.doctor_recorder_nonce += 1
+            st.rerun()
+with c2:
+    if st.button("Удалить последний фрагмент"):
+        if st.session_state.doctor_audio_segments:
+            st.session_state.doctor_audio_segments.pop()
+            st.rerun()
+        else:
+            st.info("Нет сохранённых фрагментов.")
+with c3:
+    if st.button("Очистить все фрагменты"):
+        st.session_state.doctor_audio_segments = []
+        st.session_state.doctor_recorder_nonce += 1
+        st.rerun()
+
+if st.button("Транскрибировать и заполнить протокол", type="primary"):
+    if not yandex_llm_configured():
+        st.error(
+            "Не заданы параметры для заполнения протокола: укажите "
+            "**YANDEX_FOLDER_ID** и (**YANDEX_CLOUD_API_KEY** или **YANDEX_IAM_TOKEN**) "
+            "в переменных окружения или в секретах приложения."
+        )
+        st.stop()
+
+    to_merge = list(st.session_state.doctor_audio_segments)
+    if audio_file is not None:
+        buf = bytes(audio_file.getbuffer())
+        if not to_merge or to_merge[-1] != buf:
+            to_merge.append(buf)
+
+    if not to_merge:
+        st.error("Добавьте хотя бы один аудиофрагмент или запишите и оставьте запись в микрофоне.")
+        st.stop()
+
+    merged_path = "/tmp/doctor_merged_consultation.wav"
+    try:
+        merge_wav_segments_to_file(to_merge, merged_path)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+
+    try:
+        with st.spinner("Транскрибация... Это может занять несколько минут."):
+            transcriber = AudioTranscriberWithMetrics(
+                model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
             )
-else:
-    # Doctor Mode without sidebar — always medical fine-tuned from Hub
-    mode = "Doctor Mode"
-    _hid = resolve_hub_model_id()
-    model_source = f"HF fine-tuned ({_hid})"
-    hub_model_id = _hid
-    model_size = "small"
-
-
-# ============ DOCTOR MODE ============
-if mode == "Doctor Mode":
-    st.header("Запись консультации")
-    st.warning(
-        "При первом запуске загрузка и настройка приложения могут занять несколько минут — это нормально."
-    )
-    st.caption("Нажмите на микрофон, чтобы начать запись. Нажмите ещё раз, чтобы остановить.")
-    
-    # Initialize session state
-    if "original_transcription" not in st.session_state:
-        st.session_state.original_transcription = None
-    if "protocol_editor_text" not in st.session_state:
-        st.session_state.protocol_editor_text = ""
-
-    audio_file = st.audio_input("🎙️ Запись", key="doctor_recorder")
-
-    temp_path = "/tmp/recorded_audio.wav"
-    if audio_file:
-        with open(temp_path, "wb") as f:
-            f.write(audio_file.getbuffer())
-        st.success("Запись завершена! ✓")
-
-        if st.button("Транскрибировать и заполнить протокол", type="primary"):
-            if not yandex_llm_configured():
-                st.error(
-                    "Не заданы параметры для заполнения протокола: укажите "
-                    "**YANDEX_FOLDER_ID** и (**YANDEX_CLOUD_API_KEY** или **YANDEX_IAM_TOKEN**) "
-                    "в переменных окружения или в секретах приложения."
-                )
-                st.stop()
-
-            with st.spinner("Транскрибация... Это может занять несколько минут."):
-                transcriber = AudioTranscriberWithMetrics(
-                    model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
-                )
-                transcription = transcriber.transcribe_audio(temp_path)
-
-            st.session_state.original_transcription = transcription
-            st.session_state.doctor_transcript_editor = transcription
-            st.session_state.protocol_consultation_date = format_consultation_date_gmt3()
-
+            transcription = transcribe_wav_in_chunks(transcriber, merged_path, language="ru")
+    except Exception as e:
+        st.error(f"Ошибка транскрибации: {e}")
+        st.stop()
+    finally:
+        if os.path.isfile(merged_path):
             try:
-                with st.spinner("Заполнение протокола..."):
-                    protocol = fill_protocol_from_transcript(transcription)
-                st.session_state.protocol_editor_text = format_protocol_editor_text(
-                    st.session_state.protocol_consultation_date,
-                    protocol,
-                )
-                st.success("Готово. Проверьте и при необходимости отредактируйте протокол ниже.")
-            except Exception as e:
-                st.error(f"Ошибка заполнения протокола: {e}")
-                st.session_state.protocol_editor_text = format_protocol_editor_text(
-                    st.session_state.protocol_consultation_date,
-                    {k: "" for k in PROTOCOL_FIELD_KEYS},
-                )
+                os.remove(merged_path)
+            except OSError:
+                pass
 
-    if st.session_state.original_transcription:
-        if "doctor_transcript_editor" not in st.session_state:
-            st.session_state.doctor_transcript_editor = st.session_state.original_transcription
+    st.session_state.doctor_audio_segments = []
+    st.session_state.doctor_recorder_nonce += 1
+    st.session_state.original_transcription = transcription
+    st.session_state.doctor_transcript_editor = transcription
+    st.session_state.protocol_consultation_date = format_consultation_date_gmt3()
 
-        st.header("Протокол консультации")
+    try:
+        with st.spinner("Заполнение протокола..."):
+            protocol = fill_protocol_from_transcript(transcription)
+        st.session_state.protocol_editor_text = format_protocol_editor_text(
+            st.session_state.protocol_consultation_date,
+            protocol,
+        )
+        st.success("Готово. Проверьте и при необходимости отредактируйте протокол ниже.")
+    except Exception as e:
+        st.error(f"Ошибка заполнения протокола: {e}")
+        st.session_state.protocol_editor_text = format_protocol_editor_text(
+            st.session_state.protocol_consultation_date,
+            {k: "" for k in PROTOCOL_FIELD_KEYS},
+        )
 
-        with st.expander("Транскрипт (справочно, можно исправить ошибки распознавания)"):
-            st.text_area(
-                "Транскрипт",
-                height=180,
-                key="doctor_transcript_editor",
-                label_visibility="collapsed",
-            )
+if st.session_state.original_transcription:
+    if "doctor_transcript_editor" not in st.session_state:
+        st.session_state.doctor_transcript_editor = st.session_state.original_transcription
 
+    st.header("Протокол консультации")
+
+    with st.expander("Транскрипт (справочно, можно исправить ошибки распознавания)"):
         st.text_area(
-            "Протокол (редактирование)",
-            height=320,
-            key="protocol_editor_text",
-            help="Формат: строки «Дата:», «Жалобы:», «Анамнез:», «Заключение:», «Рекомендации:» с двоеточием.",
+            "Транскрипт",
+            height=180,
+            key="doctor_transcript_editor",
+            label_visibility="collapsed",
         )
 
-        _parsed_date, fields = parse_protocol_editor_text(
-            st.session_state.get("protocol_editor_text", "")
-        )
-        consultation_date = (
-            _parsed_date.strip()
-            or st.session_state.get("protocol_consultation_date")
-            or format_consultation_date_gmt3()
-        )
+    st.text_area(
+        "Протокол (редактирование)",
+        height=320,
+        key="protocol_editor_text",
+        help="Формат: строки «Дата:», «Жалобы:», «Анамнез:», «Заключение:», «Рекомендации:» с двоеточием.",
+    )
 
-        st.subheader("Скачать протокол")
-        col1, col2 = st.columns(2)
-        doc = create_structured_protocol_docx(fields, consultation_date)
-        doc_path = "/tmp/protocol.docx"
-        doc.save(doc_path)
-        with open(doc_path, "rb") as f:
-            col1.download_button(
-                "📄 Скачать .docx",
-                f.read(),
-                "protocol.docx",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-        txt_body = build_structured_protocol_txt(fields, consultation_date)
-        col2.download_button(
-            "📄 Скачать .txt",
-            txt_body,
-            "protocol.txt",
-            "text/plain",
-        )
+    _parsed_date, fields = parse_protocol_editor_text(
+        st.session_state.get("protocol_editor_text", "")
+    )
+    consultation_date = (
+        _parsed_date.strip()
+        or st.session_state.get("protocol_consultation_date")
+        or format_consultation_date_gmt3()
+    )
 
-
-# ============ DEVELOPER MODE ============
-elif mode == "Developer Mode":
-    st.header("Загрузка данных")
-    
+    st.subheader("Скачать протокол")
     col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Аудио")
-        audio_file = st.file_uploader("Выберите аудиофайл (только WAV)", type=['wav'])
-    
-    with col2:
-        st.subheader("Эталонный текст")
-        ref_option = st.radio("Выберите способ:", ["Ввести вручную", "Загрузить .txt файл"], horizontal=True)
-        
-        reference_text = ""
-        
-        if ref_option == "Ввести вручную":
-            reference_text = st.text_area("Эталонный текст:", height=100, key="ref_manual")
-        else:
-            ref_file = st.file_uploader("Загрузите файл с эталонным текстом:", type=['txt'], key="ref_file")
-            if ref_file:
-                reference_text = str(ref_file.read(), 'utf-8')
-                st.success("Файл загружен!")
-    
-    if audio_file:
-        temp_path = f"/tmp/{audio_file.name}"
-        with open(temp_path, "wb") as f:
-            f.write(audio_file.getbuffer())
-
-        audio_path = temp_path
-        st.info("Формат: WAV")
-
-        st.audio(audio_file, format=audio_file.type)
-
-        if "dev_protocol_editor_text" not in st.session_state:
-            st.session_state.dev_protocol_editor_text = ""
-
-        # Initialize session state for results
-        if "transcription_done" not in st.session_state:
-            st.session_state.transcription_done = False
-
-        if st.button("Транскрибировать и заполнить протокол", type="primary"):
-            if not yandex_llm_configured():
-                st.error(
-                    "Не заданы **YANDEX_FOLDER_ID** и ключ доступа (**YANDEX_CLOUD_API_KEY**) "
-                    "или **YANDEX_IAM_TOKEN** в переменных окружения или секретах приложения."
-                )
-                st.stop()
-
-            with st.spinner("Транскрибация..."):
-                transcriber = AudioTranscriberWithMetrics(
-                    model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
-                )
-                transcription = transcriber.transcribe_audio(audio_path)
-
-            st.session_state.transcription = transcription
-            st.session_state.dev_transcript_editor = transcription
-            st.session_state.transcription_done = True
-            st.session_state.dev_protocol_consultation_date = format_consultation_date_gmt3()
-
-            if reference_text:
-                wer_results = transcriber.calculate_wer(reference_text, transcription)
-                rouge_results = transcriber.calculate_rouge(reference_text, transcription)
-                st.session_state.wer_results = wer_results
-                st.session_state.rouge_results = rouge_results
-            else:
-                st.session_state.pop("wer_results", None)
-                st.session_state.pop("rouge_results", None)
-
-            try:
-                with st.spinner("Заполнение протокола..."):
-                    protocol = fill_protocol_from_transcript(transcription)
-                st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
-                    st.session_state.dev_protocol_consultation_date,
-                    protocol,
-                )
-                st.success("Готово. Проверьте транскрипт, метрики и протокол.")
-            except Exception as e:
-                st.error(f"Ошибка заполнения протокола: {e}")
-                st.session_state.dev_protocol_editor_text = format_protocol_editor_text(
-                    st.session_state.dev_protocol_consultation_date,
-                    {k: "" for k in PROTOCOL_FIELD_KEYS},
-                )
-
-        # Show results if transcription was done
-        if st.session_state.transcription_done:
-            transcription = st.session_state.transcription
-
-            # Show results
-            st.header("Результаты")
-            if "dev_transcript_editor" not in st.session_state:
-                st.session_state.dev_transcript_editor = transcription
-            with st.expander("Транскрипт (справочно, можно исправить)"):
-                st.text_area(
-                    "Транскрипт",
-                    height=150,
-                    key="dev_transcript_editor",
-                    label_visibility="collapsed",
-                )
-
-            # Calculate and show metrics if reference text exists
-            wer_results = None
-            rouge_results = None
-            if reference_text:
-                if 'wer_results' not in st.session_state:
-                    with st.spinner("Расчёт метрик..."):
-                        st.session_state.wer_results = compute_wer_metrics(
-                            reference_text, transcription
-                        )
-                        st.session_state.rouge_results = compute_rouge_metrics(
-                            reference_text, transcription, get_session_rouge()
-                        )
-                
-                wer_results = st.session_state.wer_results
-                rouge_results = st.session_state.rouge_results
-                
-                st.subheader("Метрики качества")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("WER", f"{wer_results['wer_percentage']:.2f}%")
-                col2.metric("Word Accuracy", f"{(wer_results['word_accuracy']*100):.2f}%")
-                col3.metric("Слов в эталоне", wer_results['total_ref_words'])
-                col4.metric("Слов в гипотезе", wer_results['total_hyp_words'])
-                
-                if rouge_results:
-                    st.subheader("ROUGE")
-                    for rouge_type in ['rouge-1', 'rouge-2', 'rouge-l']:
-                        scores = rouge_results[rouge_type]
-                        st.write(f"**{rouge_type.upper()}**: F1={scores['f']:.2f}% | P={scores['p']:.2f}% | R={scores['r']:.2f}%")
-                
-                with st.expander("Детальный анализ слов"):
-                    col1, col2 = st.columns(2)
-                    col1.markdown("**Совпадающие:** " + ", ".join(wer_results['common_words']) if wer_results['common_words'] else "нет")
-                    col2.markdown("**Пропущенные:** " + ", ".join(wer_results['missing_words']) if wer_results['missing_words'] else "нет")
-                    st.markdown("**Лишние:** " + ", ".join(wer_results['extra_words']) if wer_results['extra_words'] else "нет")
-            else:
-                st.info("Добавьте эталонный текст выше, чтобы увидеть метрики")
-
-            st.subheader("Протокол консультации")
-            st.text_area(
-                "Протокол (редактирование)",
-                height=320,
-                key="dev_protocol_editor_text",
-                help="Формат: «Дата:», «Жалобы:», «Анамнез:», «Заключение:», «Рекомендации:».",
-            )
-
-            # Downloads
-            st.subheader("Скачать отчёт (транскрипция и метрики)")
-
-            col1, col2 = st.columns(2)
-            
-            # TXT report
-            txt_content = f"""РЕЗУЛЬТАТЫ ТРАНСКРИБАЦИИ
-========================
-
-Текст консультации:
-{transcription}
-"""
-            if reference_text and wer_results:
-                txt_content += f"""
-МЕТРИКИ КАЧЕСТВА
-=================
-WER: {wer_results['wer_percentage']:.2f}%
-Word Accuracy: {(wer_results['word_accuracy']*100):.2f}%
-Слов в эталоне: {wer_results['total_ref_words']}
-Слов в гипотезе: {wer_results['total_hyp_words']}
-
-Совпадающие: {', '.join(wer_results['common_words']) if wer_results['common_words'] else 'нет'}
-Пропущенные: {', '.join(wer_results['missing_words']) if wer_results['missing_words'] else 'нет'}
-Лишние: {', '.join(wer_results['extra_words']) if wer_results['extra_words'] else 'нет'}
-"""
-                if rouge_results:
-                    txt_content += f"""
-ROUGE-1: F1={rouge_results['rouge-1']['f']:.2f}% | P={rouge_results['rouge-1']['p']:.2f}% | R={rouge_results['rouge-1']['r']:.2f}%
-ROUGE-2: F1={rouge_results['rouge-2']['f']:.2f}% | P={rouge_results['rouge-2']['p']:.2f}% | R={rouge_results['rouge-2']['r']:.2f}%
-ROUGE-L: F1={rouge_results['rouge-l']['f']:.2f}% | P={rouge_results['rouge-l']['p']:.2f}% | R={rouge_results['rouge-l']['r']:.2f}%
-"""
-            
-            txt_path = "/tmp/report.txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(txt_content)
-            with open(txt_path, "r", encoding="utf-8") as f:
-                col1.download_button(
-                    "Скачать отчёт (.txt)",
-                    f.read(),
-                    "report.txt",
-                    "text/plain",
-                    key="dev_asr_report_txt",
-                )
-
-            # DOCX (legacy: один блок текста)
-            doc = create_protocol_docx(transcription)
-            doc_path = "/tmp/report.docx"
-            doc.save(doc_path)
-            with open(doc_path, "rb") as f:
-                col2.download_button(
-                    "Скачать отчёт (.docx)",
-                    f.read(),
-                    "report.docx",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dev_asr_report_docx",
-                )
-
-            st.subheader("Скачать протокол (как у врача)")
-            _dev_parsed_date, dev_fields = parse_protocol_editor_text(
-                st.session_state.get("dev_protocol_editor_text", "")
-            )
-            dev_consultation_date = (
-                _dev_parsed_date.strip()
-                or st.session_state.get("dev_protocol_consultation_date")
-                or format_consultation_date_gmt3()
-            )
-            sdoc = create_structured_protocol_docx(dev_fields, dev_consultation_date)
-            sdoc_path = "/tmp/dev_protocol.docx"
-            sdoc.save(sdoc_path)
-            col3, col4 = st.columns(2)
-            with open(sdoc_path, "rb") as f:
-                col3.download_button(
-                    "📄 Протокол .docx",
-                    f.read(),
-                    "protocol_dev.docx",
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key="dev_structured_docx",
-                )
-            dev_txt_body = build_structured_protocol_txt(dev_fields, dev_consultation_date)
-            col4.download_button(
-                "📄 Протокол .txt",
-                dev_txt_body,
-                "protocol_dev.txt",
-                "text/plain",
-                key="dev_structured_txt",
-            )
-
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+    doc = create_structured_protocol_docx(fields, consultation_date)
+    doc_path = "/tmp/protocol.docx"
+    doc.save(doc_path)
+    with open(doc_path, "rb") as f:
+        col1.download_button(
+            "📄 Скачать .docx",
+            f.read(),
+            "protocol.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    txt_body = build_structured_protocol_txt(fields, consultation_date)
+    col2.download_button(
+        "📄 Скачать .txt",
+        txt_body,
+        "protocol.txt",
+        "text/plain",
+    )
 
 # Footer
 st.markdown("---")
