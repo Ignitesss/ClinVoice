@@ -197,9 +197,76 @@ except ImportError:
 DEFAULT_HF_FINETUNED_REPO = "Ignites/fine_tuned_med_whisper_rus"
 DEFAULT_ASR_CHUNK_SECONDS = 30.0
 
-SPEECHKIT_RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+
+def _ice_server_key(entry: dict) -> str:
+    u = entry.get("urls")
+    if isinstance(u, list):
+        return "|".join(sorted(str(x) for x in u))
+    return str(u)
+
+
+def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
+    """
+    ICE для браузера и для aiortc на сервере: сначала встроенный набор streamlit-webrtc
+    (Twilio / Hugging Face TURN при заданных TWILIO_* или HF_TOKEN), затем дополнительные STUN,
+    затем JSON из CLINVOICE_WEBRTC_ICE_SERVERS_JSON (env или Streamlit Secrets).
+    """
+    from streamlit_webrtc.credentials import get_available_ice_servers
+
+    merged: List[dict] = []
+    seen: set[str] = set()
+
+    def add(entry: Optional[dict]) -> None:
+        if not entry or "urls" not in entry:
+            return
+        k = _ice_server_key(entry)
+        if k in seen:
+            return
+        seen.add(k)
+        merged.append(dict(entry))
+
+    try:
+        for s in get_available_ice_servers():
+            if isinstance(s, dict):
+                add(s)
+            else:
+                add(dict(s))
+    except Exception:
+        pass
+
+    for u in (
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+        "stun:stun2.l.google.com:19302",
+        "stun:stun3.l.google.com:19302",
+        "stun:stun4.l.google.com:19302",
+        "stun:stun.cloudflare.com:3478",
+        "stun:stun.services.mozilla.com:3478",
+        "stun:global.stun.twilio.com:3478?transport=udp",
+    ):
+        add({"urls": u})
+
+    raw = (os.environ.get("CLINVOICE_WEBRTC_ICE_SERVERS_JSON") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_WEBRTC_ICE_SERVERS_JSON" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_WEBRTC_ICE_SERVERS_JSON"]).strip()
+        except Exception:
+            pass
+    if raw:
+        try:
+            extra = json.loads(raw)
+            if isinstance(extra, list):
+                for item in extra:
+                    if isinstance(item, dict):
+                        add(item)
+        except json.JSONDecodeError:
+            pass
+
+    if not merged:
+        merged = [{"urls": "stun:stun.l.google.com:19302"}]
+
+    return RTCConfiguration({"iceServers": merged})
 
 
 def build_speechkit_processor_factory():
@@ -604,12 +671,23 @@ if "protocol_editor_text" not in st.session_state:
 webrtc_streamer(
     key="clinvoice_speechkit_mic",
     mode=WebRtcMode.SENDONLY,
-    rtc_configuration=SPEECHKIT_RTC_CONFIGURATION,
+    rtc_configuration=resolve_webrtc_rtc_configuration(),
     media_stream_constraints={"audio": True, "video": False},
     audio_processor_factory=build_speechkit_processor_factory(),
     async_processing=True,
     sendback_audio=False,
 )
+
+with st.expander("Долго «Connection…» или не растёт буфер записи", expanded=False):
+    st.markdown(
+        "Часто не хватает **TURN** (relay), не только STUN. Варианты:\n"
+        "1. В **Secrets** приложения задайте **`HF_TOKEN`** (токен Hugging Face) — "
+        "`streamlit-webrtc` подтянет TURN от Hugging Face (см. их документацию).\n"
+        "2. Или **`TWILIO_ACCOUNT_SID`** + **`TWILIO_AUTH_TOKEN`** для Twilio ICE.\n"
+        "3. Или переменная / секрет **`CLINVOICE_WEBRTC_ICE_SERVERS_JSON`**: JSON-массив объектов "
+        "`{ \"urls\": \"…\", \"username\": \"…\", \"credential\": \"…\" }` для вашего TURN.\n\n"
+        "После изменения Secrets перезапустите приложение."
+    )
 
 @st.fragment(run_every=timedelta(milliseconds=450))
 def _webrtc_status_fragment():
