@@ -186,7 +186,7 @@ from protocol import (
     resolve_yandex_iam_token,
     yandex_llm_configured,
 )
-from webrtc_draft import DraftAudioProcessor
+from webrtc_draft import DraftAudioProcessor, advance_after_empty_transcript
 
 # For loading fine-tuned Whisper models
 try:
@@ -203,7 +203,7 @@ def resolve_live_whisper_interval_sec() -> float:
     """
     Период тика инкрементального live-Whisper (секунды).
     **CLINVOICE_LIVE_WHISPER_INTERVAL_SEC** (env или Streamlit Secrets).
-    По умолчанию 12; значение ограничивается диапазоном [10, 15].
+    По умолчанию 6; значение ограничивается диапазоном [3, 15] (чаще тик — меньше «пропусков» в UI).
     """
     raw = (os.environ.get("CLINVOICE_LIVE_WHISPER_INTERVAL_SEC") or "").strip()
     if not raw:
@@ -212,7 +212,7 @@ def resolve_live_whisper_interval_sec() -> float:
                 raw = str(st.secrets["CLINVOICE_LIVE_WHISPER_INTERVAL_SEC"]).strip()
         except Exception:
             pass
-    default = 12.0
+    default = 6.0
     if not raw:
         v = default
     else:
@@ -220,7 +220,7 @@ def resolve_live_whisper_interval_sec() -> float:
             v = float(raw)
         except ValueError:
             v = default
-    return max(10.0, min(15.0, v))
+    return max(3.0, min(15.0, v))
 
 
 def resolve_draft_tail_max_seconds() -> float:
@@ -305,7 +305,7 @@ def resolve_draft_vad_filter() -> bool:
 def resolve_draft_tail_overlap_sec() -> float:
     """
     Перекрытие соседних кусков PCM для контекста (сек). **CLINVOICE_DRAFT_TAIL_OVERLAP_SEC**; [0, 3].
-    По умолчанию 0 (без дублирования текста на стыке).
+    По умолчанию 0.35 с (стыки сегментов без перекрытия часто «съедают» слова).
     """
     raw = (os.environ.get("CLINVOICE_DRAFT_TAIL_OVERLAP_SEC") or "").strip()
     if not raw:
@@ -315,11 +315,11 @@ def resolve_draft_tail_overlap_sec() -> float:
         except Exception:
             pass
     if not raw:
-        return 0.0
+        return 0.35
     try:
         v = float(raw)
     except ValueError:
-        return 0.0
+        return 0.35
     return max(0.0, min(3.0, v))
 
 
@@ -353,7 +353,7 @@ def _resolve_faster_whisper_no_speech_threshold(*, draft: bool) -> float:
         )
         if fn:
             raw = fn
-    default = 0.72 if draft else 0.62
+    default = 0.66 if draft else 0.62
     if not raw:
         v = default
     else:
@@ -530,6 +530,7 @@ def ensure_webrtc_shared_initialized() -> None:
             "live_whisper_text": "",
             "live_whisper_error": None,
             "live_draft_pcm_committed": 0,
+            "_draft_empty_streak": 0,
         }
         return
     w.setdefault("lock", threading.Lock())
@@ -538,6 +539,7 @@ def ensure_webrtc_shared_initialized() -> None:
     w.setdefault("live_whisper_text", "")
     w.setdefault("live_whisper_error", None)
     w.setdefault("live_draft_pcm_committed", 0)
+    w.setdefault("_draft_empty_streak", 0)
     w.pop("live_whisper_last_processed_pcm_len", None)
 
 
@@ -594,6 +596,7 @@ def flush_incremental_pcm_tail(
     lk = shared.get("lock")
     if not lk:
         return "Нет lock"
+    min_new_b = int(resolve_draft_min_new_seconds() * 32000)
     while True:
         with lk:
             pcm = bytes(shared.get("pcm_accum") or b"")
@@ -617,11 +620,20 @@ def flush_incremental_pcm_tail(
             shared["live_whisper_error"] = None
             prev = (shared.get("live_whisper_text") or "").strip()
             if t:
+                shared["_draft_empty_streak"] = 0
                 if prev:
                     shared["live_whisper_text"] = (prev + " " + t).strip()
                 else:
                     shared["live_whisper_text"] = t
-            shared["live_draft_pcm_committed"] = committed + take
+                shared["live_draft_pcm_committed"] = committed + take
+            else:
+                es = int(shared.get("_draft_empty_streak") or 0)
+                adv, nes = advance_after_empty_transcript(chunk, take, min_new_b, es)
+                if adv:
+                    shared["_draft_empty_streak"] = 0
+                    shared["live_draft_pcm_committed"] = committed + take
+                else:
+                    shared["_draft_empty_streak"] = nes
     return None
 
 
