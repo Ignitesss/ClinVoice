@@ -74,7 +74,6 @@ from protocol import (
     resolve_yandex_iam_token,
     yandex_llm_configured,
 )
-from speechkit_stream import speechkit_stt_configured
 from webrtc_draft import DraftAudioProcessor
 
 # For loading fine-tuned Whisper models
@@ -92,13 +91,20 @@ SPEECHKIT_RTC_CONFIGURATION = RTCConfiguration(
 )
 
 
-def speechkit_processor_factory():
-    return DraftAudioProcessor(
-        st.session_state.speechkit_shared,
-        resolve_yandex_api_key(),
-        resolve_yandex_folder_id(),
-        resolve_yandex_iam_token(),
-    )
+def build_speechkit_processor_factory():
+    """
+    Вызывать из основного потока Streamlit. Возвращает фабрику без обращения к
+    session_state внутри worker WebRTC.
+    """
+    shared = st.session_state.speechkit_shared
+    api_key = resolve_yandex_api_key()
+    folder_id = resolve_yandex_folder_id()
+    iam_token = resolve_yandex_iam_token()
+
+    def _factory():
+        return DraftAudioProcessor(shared, api_key, folder_id, iam_token)
+
+    return _factory
 
 
 def resolve_asr_chunk_seconds() -> float:
@@ -120,41 +126,15 @@ def resolve_asr_chunk_seconds() -> float:
     return DEFAULT_ASR_CHUNK_SECONDS
 
 
-def _read_wav_params(data: bytes):
-    with wave.open(io.BytesIO(data), "rb") as w:
-        nframes = w.getnframes()
-        return w.getnchannels(), w.getsampwidth(), w.getframerate(), nframes, w.readframes(nframes)
-
-
-def merge_wav_segments_to_bytes(segments: List[bytes]) -> bytes:
-    """Склеить несколько WAV с одинаковыми параметрами (mono, один sampwidth, одна частота)."""
-    if not segments:
-        raise ValueError("Нет сегментов для склейки")
-    first_ch, first_sw, first_fr, _first_nf, first_frames = _read_wav_params(segments[0])
-    if first_ch != 1:
-        raise ValueError("Ожидается моно WAV (1 канал)")
-    if first_fr != 16000:
-        raise ValueError(f"Ожидается частота 16000 Hz, получено {first_fr}")
-    all_frames = [first_frames]
-    for i, seg in enumerate(segments[1:], start=2):
-        ch, sw, fr, _nf, frames = _read_wav_params(seg)
-        if (ch, sw, fr) != (first_ch, first_sw, first_fr):
-            raise ValueError(f"Сегмент {i}: несовпадение формата WAV с первым фрагментом")
-        all_frames.append(frames)
+def pcm_mono_s16le_to_wav_bytes(pcm: bytes, sample_rate: int = 16000) -> bytes:
+    """Обёртка сырых PCM s16le mono в WAV (для Whisper)."""
     out = io.BytesIO()
-    with wave.open(out, "wb") as wout:
-        wout.setnchannels(first_ch)
-        wout.setsampwidth(first_sw)
-        wout.setframerate(first_fr)
-        for frame_chunk in all_frames:
-            wout.writeframes(frame_chunk)
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
     return out.getvalue()
-
-
-def merge_wav_segments_to_file(segments: List[bytes], out_path: str) -> None:
-    data = merge_wav_segments_to_bytes(segments)
-    with open(out_path, "wb") as f:
-        f.write(data)
 
 
 def transcribe_wav_in_chunks(transcriber: "AudioTranscriberWithMetrics", wav_path: str, language: str = "ru") -> str:
@@ -292,6 +272,18 @@ st.set_page_config(
     page_icon="🏥",
     layout="wide"
 )
+
+# До любых виджетов: WebRTC вызывает audio_processor_factory из фонового потока,
+# там нельзя обращаться к st.session_state — только замыкание на готовый dict.
+if "speechkit_shared" not in st.session_state:
+    st.session_state.speechkit_shared = {
+        "draft": "",
+        "error": None,
+        "lock": threading.Lock(),
+        "pcm_accum": bytearray(),
+    }
+else:
+    st.session_state.speechkit_shared.setdefault("pcm_accum", bytearray())
 
 # ============ CLASSES FROM YOUR COLAB ============
 
@@ -497,100 +489,46 @@ if "original_transcription" not in st.session_state:
     st.session_state.original_transcription = None
 if "protocol_editor_text" not in st.session_state:
     st.session_state.protocol_editor_text = ""
-if "doctor_audio_segments" not in st.session_state:
-    st.session_state.doctor_audio_segments = []
-if "doctor_recorder_nonce" not in st.session_state:
-    st.session_state.doctor_recorder_nonce = 0
-if "speechkit_shared" not in st.session_state:
-    st.session_state.speechkit_shared = {
-        "draft": "",
-        "error": None,
-        "lock": threading.Lock(),
-    }
-st.warning(
-    "При первом запуске загрузка и настройка приложения могут занять несколько минут — это нормально."
-)
-st.caption(
-    "Записывайте фрагменты по очереди: старт/стоп микрофона, затем «Добавить фрагмент». "
-    "Так можно делать паузы между частями консультации. Длинное аудио распознаётся по частям "
-    f"до {int(resolve_asr_chunk_seconds())} с — меньше нагрузка на память."
+
+webrtc_streamer(
+    key="clinvoice_speechkit_mic",
+    mode=WebRtcMode.SENDONLY,
+    rtc_configuration=SPEECHKIT_RTC_CONFIGURATION,
+    media_stream_constraints={"audio": True, "video": False},
+    audio_processor_factory=build_speechkit_processor_factory(),
+    async_processing=True,
+    sendback_audio=False,
 )
 
-if speechkit_stt_configured(resolve_yandex_api_key(), resolve_yandex_iam_token()):
-    st.subheader("Черновик во время речи (SpeechKit)")
-    st.caption(
-        "Ниже — потоковое распознавание Yandex SpeechKit для подсказки во время диктовки. "
-        "Итоговый транскрипт и протокол формируются **только из Whisper** после кнопки транскрибации. "
-        "В каталоге Yandex Cloud сервисному аккаунту нужна роль **ai.speechkit-stt.user**; SpeechKit тарифицируется отдельно от YandexGPT."
-    )
-    webrtc_streamer(
-        key="clinvoice_speechkit_mic",
-        mode=WebRtcMode.SENDONLY,
-        rtc_configuration=SPEECHKIT_RTC_CONFIGURATION,
-        media_stream_constraints={"audio": True, "video": False},
-        audio_processor_factory=speechkit_processor_factory,
-        async_processing=True,
-        sendback_audio=False,
-    )
+@st.fragment(run_every=timedelta(milliseconds=450))
+def _webrtc_status_fragment():
+    sh = st.session_state.speechkit_shared
+    lk = sh.get("lock")
+    sec = 0.0
+    draft = ""
+    err: Optional[str] = None
+    if lk:
+        with lk:
+            sec = len(sh.get("pcm_accum") or b"") / 32000.0
+            draft = sh.get("draft") or ""
+            err = sh.get("error")
+    st.caption(f"Накоплено под Whisper: **~{sec:.1f}** с.")
+    if err:
+        st.error(err)
+    elif draft.strip():
+        st.info(draft)
 
-    @st.fragment(run_every=timedelta(milliseconds=450))
-    def _speechkit_draft_fragment():
-        sh = st.session_state.speechkit_shared
-        lk = sh.get("lock")
-        draft = ""
-        err: Optional[str] = None
-        if lk:
-            with lk:
-                draft = sh.get("draft") or ""
-                err = sh.get("error")
-        if err:
-            st.error(err)
-        elif draft.strip():
-            st.info(draft)
-        else:
-            st.caption("Включите запись в блоке выше — здесь появится черновик.")
 
-    _speechkit_draft_fragment()
-    if st.button("Сбросить черновик SpeechKit", key="speechkit_reset_draft"):
-        lk = st.session_state.speechkit_shared.get("lock")
-        if lk:
-            with lk:
-                st.session_state.speechkit_shared["draft"] = ""
-                st.session_state.speechkit_shared["error"] = None
-        st.rerun()
-else:
-    st.info(
-        "Черновик SpeechKit недоступен: задайте **YANDEX_CLOUD_API_KEY** или **YANDEX_IAM_TOKEN** "
-        "(как для протокола). Опционально **YANDEX_FOLDER_ID** — передаётся в запрос SpeechKit."
-    )
+_webrtc_status_fragment()
 
-seg_count = len(st.session_state.doctor_audio_segments)
-st.caption(f"Сохранено фрагментов в консультации: **{seg_count}**")
-
-rec_key = f"doctor_recorder_{st.session_state.doctor_recorder_nonce}"
-audio_file = st.audio_input("🎙️ Запись фрагмента", key=rec_key, sample_rate=16000)
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    if st.button("Добавить фрагмент в консультацию"):
-        if audio_file is None:
-            st.warning("Сначала запишите фрагмент микрофоном.")
-        else:
-            st.session_state.doctor_audio_segments.append(bytes(audio_file.getbuffer()))
-            st.session_state.doctor_recorder_nonce += 1
-            st.rerun()
-with c2:
-    if st.button("Удалить последний фрагмент"):
-        if st.session_state.doctor_audio_segments:
-            st.session_state.doctor_audio_segments.pop()
-            st.rerun()
-        else:
-            st.info("Нет сохранённых фрагментов.")
-with c3:
-    if st.button("Очистить все фрагменты"):
-        st.session_state.doctor_audio_segments = []
-        st.session_state.doctor_recorder_nonce += 1
-        st.rerun()
+if st.button("Сбросить запись и черновик", key="webrtc_reset_buffer"):
+    lk = st.session_state.speechkit_shared.get("lock")
+    if lk:
+        with lk:
+            st.session_state.speechkit_shared["pcm_accum"] = bytearray()
+            st.session_state.speechkit_shared["draft"] = ""
+            st.session_state.speechkit_shared["error"] = None
+    st.rerun()
 
 if st.button("Транскрибировать и заполнить протокол", type="primary"):
     if not yandex_llm_configured():
@@ -601,24 +539,24 @@ if st.button("Транскрибировать и заполнить прото�
         )
         st.stop()
 
-    to_merge = list(st.session_state.doctor_audio_segments)
-    if audio_file is not None:
-        buf = bytes(audio_file.getbuffer())
-        if not to_merge or to_merge[-1] != buf:
-            to_merge.append(buf)
+    sh = st.session_state.speechkit_shared
+    lk = sh.get("lock")
+    pcm = b""
+    if lk:
+        with lk:
+            pcm = bytes(sh.get("pcm_accum") or b"")
 
-    if not to_merge:
-        st.error("Добавьте хотя бы один аудиофрагмент или запишите и оставьте запись в микрофоне.")
+    if len(pcm) < 32000:
+        st.error("Включите запись в блоке выше и наговорите хотя бы около секунды.")
         st.stop()
 
-    merged_path = "/tmp/doctor_merged_consultation.wav"
+    wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
+    merged_path = None
     try:
-        merge_wav_segments_to_file(to_merge, merged_path)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
-
-    try:
+        fd, merged_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        with open(merged_path, "wb") as wf:
+            wf.write(wav_bytes)
         with st.spinner("Транскрибация... Это может занять несколько минут."):
             transcriber = AudioTranscriberWithMetrics(
                 model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
@@ -628,14 +566,12 @@ if st.button("Транскрибировать и заполнить прото�
         st.error(f"Ошибка транскрибации: {e}")
         st.stop()
     finally:
-        if os.path.isfile(merged_path):
+        if merged_path and os.path.isfile(merged_path):
             try:
                 os.remove(merged_path)
             except OSError:
                 pass
 
-    st.session_state.doctor_audio_segments = []
-    st.session_state.doctor_recorder_nonce += 1
     st.session_state.original_transcription = transcription
     st.session_state.doctor_transcript_editor = transcription
     st.session_state.protocol_consultation_date = format_consultation_date_gmt3()
@@ -654,6 +590,11 @@ if st.button("Транскрибировать и заполнить прото�
         )
         _auto_txt = build_structured_protocol_txt(protocol, st.session_state.protocol_consultation_date)
         trigger_browser_text_download("protocol.txt", _auto_txt)
+        if lk:
+            with lk:
+                st.session_state.speechkit_shared["pcm_accum"] = bytearray()
+                st.session_state.speechkit_shared["draft"] = ""
+                st.session_state.speechkit_shared["error"] = None
     except Exception as e:
         st.error(f"Ошибка заполнения протокола: {e}")
         st.session_state.protocol_editor_text = format_protocol_editor_text(

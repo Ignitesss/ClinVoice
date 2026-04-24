@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Обработчик аудио WebRTC → PCM → SpeechKit (черновик)."""
+"""Обработчик аудио WebRTC → PCM (буфер для Whisper) и опционально SpeechKit (черновик)."""
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -17,9 +18,18 @@ from speechkit_stream import (
     speechkit_stt_configured,
 )
 
+_DEFAULT_MAX_PCM = 80 * 1024 * 1024
+
+
+def _max_pcm_bytes() -> int:
+    raw = (os.environ.get("CLINVOICE_MAX_PCM_BYTES") or "").strip()
+    if raw.isdigit():
+        return max(1_000_000, int(raw))
+    return _DEFAULT_MAX_PCM
+
 
 class DraftAudioProcessor(AudioProcessorBase):
-    """Принимает очередь AudioFrame, шлёт LINEAR16 16 kHz mono в SpeechKit."""
+    """Принимает очередь AudioFrame: накапливает PCM для Whisper; при наличии ключей — SpeechKit."""
 
     def __init__(
         self,
@@ -54,15 +64,30 @@ class DraftAudioProcessor(AudioProcessorBase):
         else:
             self._shared["error"] = msg
 
+    def _append_pcm(self, pcm: bytes) -> None:
+        lk = self._shared.get("lock")
+        if not lk or not pcm:
+            return
+        max_b = _max_pcm_bytes()
+        with lk:
+            acc = self._shared.setdefault("pcm_accum", bytearray())
+            if len(acc) + len(pcm) > max_b:
+                overflow = len(acc) + len(pcm) - max_b
+                del acc[:overflow]
+            acc.extend(pcm)
+
     async def recv_queued(self, frames: List[av.AudioFrame]) -> List[av.AudioFrame]:
         if not frames:
-            return frames
-        if not speechkit_stt_configured(self._api_key, self._iam_token):
             return frames
         if self._resampler is None:
             self._resampler = make_audio_resampler_s16_mono_16k()
         pcm = audio_frames_to_pcm_mono_s16le_16k(frames, self._resampler)
         if not pcm:
+            return frames
+
+        self._append_pcm(pcm)
+
+        if not speechkit_stt_configured(self._api_key, self._iam_token):
             return frames
 
         with self._lock:
