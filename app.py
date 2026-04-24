@@ -64,6 +64,41 @@ from zoneinfo import ZoneInfo
 
 from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
 
+
+def _patch_streamlit_webrtc_shutdown_observer_stop() -> None:
+    """
+    streamlit-webrtc: при вложенном вызове SessionShutdownObserver.stop() из polling-потока
+    поле _polling_thread обнуляется до is_alive() в основном потоке → AttributeError.
+    Сохраняем ссылку на Thread в локальной переменной (как следовало бы в апстриме).
+    """
+    import logging
+
+    try:
+        from streamlit_webrtc.shutdown import SessionShutdownObserver
+    except Exception:
+        return
+
+    def _safe_stop(self, timeout: float = 1.0) -> None:
+        poll_thread = self._polling_thread
+        if not poll_thread:
+            return
+        self._polling_thread_stop_event.set()
+        log = logging.getLogger("streamlit_webrtc.shutdown")
+        if threading.current_thread() is not poll_thread:
+            poll_thread.join(timeout=timeout)
+            if poll_thread.is_alive():
+                log.warning("ShutdownPolling thread did not exit cleanly")
+            else:
+                log.debug("ShutdownPolling thread stopped cleanly")
+        else:
+            log.debug("Stop called from polling thread itself, skipping join.")
+        self._polling_thread = None
+
+    SessionShutdownObserver.stop = _safe_stop  # type: ignore[method-assign]
+
+
+_patch_streamlit_webrtc_shutdown_observer_stop()
+
 from protocol import (
     PROTOCOL_FIELD_KEYS,
     fill_protocol_from_transcript,
