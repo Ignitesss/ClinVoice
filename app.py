@@ -99,6 +99,82 @@ def _patch_streamlit_webrtc_shutdown_observer_stop() -> None:
 
 _patch_streamlit_webrtc_shutdown_observer_stop()
 
+
+def _patch_aioice_transaction_retry() -> None:
+    """
+    aioice: после закрытия UDP-транспорта таймер STUN всё ещё вызывает sendto → NoneType.
+    Гасим повтор и завершаем future, чтобы не сыпались callback-ошибки в asyncio (особенно на Python 3.14).
+    """
+    import asyncio
+
+    try:
+        from aioice.stun import Transaction, TransactionTimeout
+    except Exception:
+        return
+    if getattr(Transaction, "_clinvoice_retry_patched", False):
+        return
+
+    def _safe_retry(self) -> None:
+        tries = getattr(self, "_Transaction__tries")
+        tries_max = getattr(self, "_Transaction__tries_max")
+        future = getattr(self, "_Transaction__future")
+        if tries >= tries_max:
+            if not future.done():
+                try:
+                    future.set_exception(TransactionTimeout())
+                except (RuntimeError, asyncio.InvalidStateError):
+                    pass
+            return
+        proto = getattr(self, "_Transaction__protocol")
+        req = getattr(self, "_Transaction__request")
+        addr = getattr(self, "_Transaction__addr")
+        try:
+            proto.send_stun(req, addr)
+        except (AttributeError, OSError, RuntimeError):
+            handle = getattr(self, "_Transaction__timeout_handle", None)
+            if handle:
+                try:
+                    handle.cancel()
+                except Exception:
+                    pass
+            setattr(self, "_Transaction__timeout_handle", None)
+            if not future.done():
+                try:
+                    future.set_exception(TransactionTimeout())
+                except (RuntimeError, asyncio.InvalidStateError):
+                    pass
+            return
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            if not future.done():
+                try:
+                    future.set_exception(TransactionTimeout())
+                except (RuntimeError, asyncio.InvalidStateError):
+                    pass
+            return
+        if loop.is_closed():
+            if not future.done():
+                try:
+                    future.set_exception(TransactionTimeout())
+                except (RuntimeError, asyncio.InvalidStateError):
+                    pass
+            return
+        delay = getattr(self, "_Transaction__timeout_delay")
+        setattr(
+            self,
+            "_Transaction__timeout_handle",
+            loop.call_later(delay, _safe_retry, self),
+        )
+        setattr(self, "_Transaction__timeout_delay", delay * 2)
+        setattr(self, "_Transaction__tries", tries + 1)
+
+    Transaction._Transaction__retry = _safe_retry  # type: ignore[assignment]
+    Transaction._clinvoice_retry_patched = True
+
+
+_patch_aioice_transaction_retry()
+
 from protocol import (
     PROTOCOL_FIELD_KEYS,
     fill_protocol_from_transcript,

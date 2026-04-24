@@ -11,5 +11,6 @@ grpcio>=1.78.0
 protobuf>=4.25.0
 yandexcloud>=0.360.0
 streamlit-webrtc>=0.64.5
-aiortc>=1.9.0
+aiortc>=1.14.0
+aioice>=0.10.2
 av>=12.0.0
