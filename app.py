@@ -808,23 +808,45 @@ webrtc_streamer(
     translations=WEBRTC_UI_RU,
 )
 
-_sync_live_transcript_from_whisper()
-st.text_area(
-    "Транскрипт (можно править во время записи)",
-    height=160,
-    key="live_transcript_editor",
-    on_change=_mark_live_transcript_dirty,
-    help="Пока вы не меняли текст вручную, сюда подставляется черновик Whisper. "
-    "После правки используйте кнопку ниже, чтобы снова подставить последний авто-текст.",
-)
-if st.button("Подставить последний авто-текст", key="apply_live_whisper_to_editor"):
-    _lk = st.session_state.webrtc_shared.get("lock")
-    if _lk:
-        with _lk:
-            auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
-        st.session_state.live_transcript_editor = auto
-        st.session_state.transcript_user_dirty = False
+if st.session_state.pop("_pending_webrtc_full_reset", False):
+    _rlk = st.session_state.webrtc_shared.get("lock")
+    if _rlk:
+        with _rlk:
+            st.session_state.webrtc_shared["pcm_accum"] = bytearray()
+            st.session_state.webrtc_shared["live_whisper_text"] = ""
+            st.session_state.webrtc_shared["live_whisper_error"] = None
+            st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
+    st.session_state.live_transcript_editor = ""
+    st.session_state.transcript_user_dirty = False
+
+if st.session_state.pop("_pending_apply_live_whisper", False):
+    _alk = st.session_state.webrtc_shared.get("lock")
+    _auto = ""
+    if _alk:
+        with _alk:
+            _auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
+    st.session_state.live_transcript_editor = _auto
+    st.session_state.transcript_user_dirty = False
+
+
+@st.fragment(run_every=timedelta(milliseconds=650))
+def _live_transcript_fragment():
+    """Периодически подтягивает черновик Whisper в поле (полный скрипт при этом не перезапускается)."""
+    _sync_live_transcript_from_whisper()
+    st.text_area(
+        "Транскрипт (можно править во время записи)",
+        height=160,
+        key="live_transcript_editor",
+        on_change=_mark_live_transcript_dirty,
+        help="Пока вы не меняли текст вручную, сюда подставляется черновик Whisper. "
+        "После правки используйте кнопку ниже, чтобы снова подставить последний авто-текст.",
+    )
+    if st.button("Подставить последний авто-текст", key="apply_live_whisper_to_editor"):
+        st.session_state._pending_apply_live_whisper = True
         st.rerun()
+
+
+_live_transcript_fragment()
 
 @st.fragment(run_every=timedelta(milliseconds=450))
 def _webrtc_status_fragment():
@@ -847,15 +869,7 @@ def _webrtc_status_fragment():
 _webrtc_status_fragment()
 
 if st.button("Сбросить запись и черновик", key="webrtc_reset_buffer"):
-    lk = st.session_state.webrtc_shared.get("lock")
-    if lk:
-        with lk:
-            st.session_state.webrtc_shared["pcm_accum"] = bytearray()
-            st.session_state.webrtc_shared["live_whisper_text"] = ""
-            st.session_state.webrtc_shared["live_whisper_error"] = None
-            st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
-    st.session_state.live_transcript_editor = ""
-    st.session_state.transcript_user_dirty = False
+    st.session_state._pending_webrtc_full_reset = True
     st.rerun()
 
 st.checkbox(
