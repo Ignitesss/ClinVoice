@@ -8,6 +8,57 @@ import os
 import streamlit as st
 import streamlit.components.v1 as components
 
+# Ключ `webrtc_streamer(..., key=...)` — должен совпадать с проверками в патче ниже.
+CLINVOICE_WEBRTC_STREAMER_KEY = "clinvoice_webrtc_mic"
+
+
+def _patch_streamlit_safe_session_state_for_webrtc_cache_clear() -> None:
+    """
+    После «Clear cache» / сброса session_state Streamlit вызывает on_change у streamlit-webrtc
+    до выполнения скрипта; callback делает st.session_state[frontend_key] и падает с KeyError.
+    Подставляем безопасные заглушки только для ключей нашего микрофона.
+    """
+    try:
+        from streamlit.runtime.state import safe_session_state as sss
+    except Exception:
+        return
+
+    cls = sss.SafeSessionState
+    if getattr(cls, "_clinvoice_webrtc_ss_clear_patch", False):
+        return
+
+    _orig_getitem = cls.__getitem__
+
+    def __getitem__(self, key: str):
+        self._yield_callback()
+        with self._lock:
+            try:
+                return self._state[key]
+            except KeyError:
+                if key == CLINVOICE_WEBRTC_STREAMER_KEY:
+                    from streamlit_webrtc.component import (
+                        WebRtcStreamerContext,
+                        WebRtcStreamerState,
+                    )
+
+                    return WebRtcStreamerContext(
+                        worker=None,
+                        state=WebRtcStreamerState(playing=False, signalling=False),
+                    )
+                try:
+                    from streamlit_webrtc.component import generate_frontend_component_key
+                except Exception:
+                    raise
+                if key == generate_frontend_component_key(CLINVOICE_WEBRTC_STREAMER_KEY):
+                    return {}
+                raise
+
+    cls.__getitem__ = __getitem__  # type: ignore[method-assign]
+    cls._clinvoice_webrtc_ss_clear_patch = True
+
+
+_patch_streamlit_safe_session_state_for_webrtc_cache_clear()
+
 
 def resolve_app_cache_root() -> str:
     """Корень кэша артефактов: env CLINVOICE_CACHE_DIR, секрет Streamlit, или ~/.cache/clinvoice."""
@@ -1136,7 +1187,7 @@ _live_interval = resolve_live_whisper_interval_sec()
 _asr_transcriber = get_cached_asr_transcriber(model_size, hub_model_id)
 
 webrtc_streamer(
-    key="clinvoice_webrtc_mic",
+    key=CLINVOICE_WEBRTC_STREAMER_KEY,
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=resolve_webrtc_rtc_configuration(),
     media_stream_constraints={"audio": True, "video": False},
