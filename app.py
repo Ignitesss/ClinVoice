@@ -200,8 +200,8 @@ DEFAULT_ASR_CHUNK_SECONDS = 30.0
 
 def resolve_live_whisper_interval_sec() -> float:
     """
-    Период полного чернового прогона Whisper по нарастающему PCM (секунды).
-    Задаётся **CLINVOICE_LIVE_WHISPER_INTERVAL_SEC** (env или Streamlit Secrets).
+    Период тика инкрементального live-Whisper (секунды).
+    **CLINVOICE_LIVE_WHISPER_INTERVAL_SEC** (env или Streamlit Secrets).
     По умолчанию 12; значение ограничивается диапазоном [10, 15].
     """
     raw = (os.environ.get("CLINVOICE_LIVE_WHISPER_INTERVAL_SEC") or "").strip()
@@ -220,6 +220,106 @@ def resolve_live_whisper_interval_sec() -> float:
         except ValueError:
             v = default
     return max(10.0, min(15.0, v))
+
+
+def resolve_draft_tail_max_seconds() -> float:
+    """
+    Макс. длина одного PCM-среза для инкрементального live-черновика (сек).
+    **CLINVOICE_DRAFT_TAIL_MAX_SECONDS** — env или Secrets; по умолчанию 15; диапазон [5, 60].
+    """
+    raw = (os.environ.get("CLINVOICE_DRAFT_TAIL_MAX_SECONDS") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DRAFT_TAIL_MAX_SECONDS" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_DRAFT_TAIL_MAX_SECONDS"]).strip()
+        except Exception:
+            pass
+    default = 15.0
+    if not raw:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = default
+    return max(5.0, min(60.0, v))
+
+
+def resolve_draft_min_new_seconds() -> float:
+    """
+    Минимум нового PCM (сек) перед очередным куском live-черновика.
+    **CLINVOICE_DRAFT_MIN_NEW_SECONDS**; по умолчанию 1.0; диапазон [0.2, 5].
+    """
+    raw = (os.environ.get("CLINVOICE_DRAFT_MIN_NEW_SECONDS") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DRAFT_MIN_NEW_SECONDS" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_DRAFT_MIN_NEW_SECONDS"]).strip()
+        except Exception:
+            pass
+    default = 1.0
+    if not raw:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = default
+    return max(0.2, min(5.0, v))
+
+
+def resolve_draft_beam_size() -> int:
+    """**CLINVOICE_DRAFT_BEAM_SIZE** для live-кусков (faster-whisper). По умолчанию 1; [1, 5]."""
+    raw = (os.environ.get("CLINVOICE_DRAFT_BEAM_SIZE") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DRAFT_BEAM_SIZE" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_DRAFT_BEAM_SIZE"]).strip()
+        except Exception:
+            pass
+    if raw.isdigit():
+        return max(1, min(5, int(raw)))
+    return 1
+
+
+def resolve_draft_vad_filter() -> bool:
+    """
+    **CLINVOICE_DRAFT_VAD_FILTER**: 1/true/yes — включить VAD для live-кусков (faster-whisper).
+    Иначе выключено. По умолчанию включено.
+    """
+    raw = (os.environ.get("CLINVOICE_DRAFT_VAD_FILTER") or "").strip().lower()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DRAFT_VAD_FILTER" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_DRAFT_VAD_FILTER"]).strip().lower()
+        except Exception:
+            pass
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return True
+
+
+def resolve_draft_tail_overlap_sec() -> float:
+    """
+    Перекрытие соседних кусков PCM для контекста (сек). **CLINVOICE_DRAFT_TAIL_OVERLAP_SEC**; [0, 3].
+    По умолчанию 0 (без дублирования текста на стыке).
+    """
+    raw = (os.environ.get("CLINVOICE_DRAFT_TAIL_OVERLAP_SEC") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DRAFT_TAIL_OVERLAP_SEC" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_DRAFT_TAIL_OVERLAP_SEC"]).strip()
+        except Exception:
+            pass
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(3.0, v))
 
 
 def _ice_server_key(entry: dict) -> str:
@@ -305,7 +405,7 @@ WEBRTC_UI_RU: dict = {
 
 
 def get_cached_asr_transcriber(model_size: str, hub_model_id: str) -> "AudioTranscriberWithMetrics":
-    """Один экземпляр распознавателя на (hub, model_size) для финала и фонового черновика."""
+    """Один экземпляр распознавателя на (hub, model_size) для live-кусков и опционального полного прогона."""
     safe = (hub_model_id or "").replace("/", "_")
     cache_key = f"_clinvoice_asr_{safe}_{model_size}"
     if cache_key not in st.session_state:
@@ -313,6 +413,75 @@ def get_cached_asr_transcriber(model_size: str, hub_model_id: str) -> "AudioTran
             model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
         )
     return st.session_state[cache_key]
+
+
+def transcribe_pcm_bytes_to_text(
+    transcriber: "AudioTranscriberWithMetrics",
+    pcm: bytes,
+    *,
+    draft: bool,
+) -> str:
+    """PCM s16le mono 16k → временный WAV → Whisper (короткие срезы обычно без чанкования)."""
+    if not pcm:
+        return ""
+    merged_path = None
+    try:
+        fd, merged_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        with open(merged_path, "wb") as wf:
+            wf.write(pcm_mono_s16le_to_wav_bytes(pcm))
+        return transcribe_wav_in_chunks(transcriber, merged_path, language="ru", draft=draft)
+    finally:
+        if merged_path and os.path.isfile(merged_path):
+            try:
+                os.remove(merged_path)
+            except OSError:
+                pass
+
+
+def flush_incremental_pcm_tail(
+    shared: dict,
+    transcriber: "AudioTranscriberWithMetrics",
+    asr_lock: threading.Lock,
+    max_segment_bytes: int,
+    overlap_bytes: int,
+) -> Optional[str]:
+    """
+    Догоняет необработанный хвост PCM в live_whisper_text (те же сегменты, что в фоне).
+    Возвращает сообщение об ошибке или None.
+    """
+    lk = shared.get("lock")
+    if not lk:
+        return "Нет lock"
+    while True:
+        with lk:
+            pcm = bytes(shared.get("pcm_accum") or b"")
+            committed = int(shared.get("live_draft_pcm_committed") or 0)
+            n = len(pcm)
+        if committed >= n:
+            break
+        take = min(n - committed, max_segment_bytes)
+        ov = min(overlap_bytes, committed)
+        start = committed - ov
+        chunk = pcm[start : committed + take]
+        try:
+            with asr_lock:
+                text = transcribe_pcm_bytes_to_text(transcriber, chunk, draft=True)
+        except Exception as e:
+            with lk:
+                shared["live_whisper_error"] = str(e)
+            return str(e)
+        t = (text or "").strip()
+        with lk:
+            shared["live_whisper_error"] = None
+            prev = (shared.get("live_whisper_text") or "").strip()
+            if t:
+                if prev:
+                    shared["live_whisper_text"] = (prev + " " + t).strip()
+                else:
+                    shared["live_whisper_text"] = t
+            shared["live_draft_pcm_committed"] = committed + take
+    return None
 
 
 def build_webrtc_processor_factory(
@@ -325,31 +494,29 @@ def build_webrtc_processor_factory(
     """
     shared = st.session_state.webrtc_shared
     asr_lock = shared["asr_lock"]
+    max_seg_b = int(resolve_draft_tail_max_seconds() * 32000)
+    min_new_b = int(resolve_draft_min_new_seconds() * 32000)
+    overlap_b = int(resolve_draft_tail_overlap_sec() * 32000)
 
-    def _transcribe_pcm(pcm: bytes) -> Tuple[str, Optional[str]]:
-        if not pcm:
+    def _transcribe_pcm(pcm_slice: bytes) -> Tuple[str, Optional[str]]:
+        if not pcm_slice:
             return "", None
-        merged_path = None
         try:
-            fd, merged_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
-            with open(merged_path, "wb") as wf:
-                wf.write(wav_bytes)
             with asr_lock:
-                text = transcribe_wav_in_chunks(transcriber, merged_path, language="ru")
+                text = transcribe_pcm_bytes_to_text(transcriber, pcm_slice, draft=True)
             return text, None
         except Exception as e:
             return "", str(e)
-        finally:
-            if merged_path and os.path.isfile(merged_path):
-                try:
-                    os.remove(merged_path)
-                except OSError:
-                    pass
 
     def _factory():
-        return DraftAudioProcessor(shared, _transcribe_pcm, interval_sec)
+        return DraftAudioProcessor(
+            shared,
+            _transcribe_pcm,
+            interval_sec,
+            max_seg_b,
+            min_new_b,
+            overlap_b,
+        )
 
     return _factory
 
@@ -384,7 +551,13 @@ def pcm_mono_s16le_to_wav_bytes(pcm: bytes, sample_rate: int = 16000) -> bytes:
     return out.getvalue()
 
 
-def transcribe_wav_in_chunks(transcriber: "AudioTranscriberWithMetrics", wav_path: str, language: str = "ru") -> str:
+def transcribe_wav_in_chunks(
+    transcriber: "AudioTranscriberWithMetrics",
+    wav_path: str,
+    language: str = "ru",
+    *,
+    draft: bool = False,
+) -> str:
     """Длинный WAV режется на части ≤ resolve_asr_chunk_seconds(); короткий — один вызов transcribe_audio."""
     chunk_sec = resolve_asr_chunk_seconds()
     with wave.open(wav_path, "rb") as w:
@@ -397,7 +570,7 @@ def transcribe_wav_in_chunks(transcriber: "AudioTranscriberWithMetrics", wav_pat
         frames_bytes = w.readframes(nframes)
     duration = nframes / float(fr)
     if duration <= chunk_sec:
-        return transcriber.transcribe_audio(wav_path, language=language)
+        return transcriber.transcribe_audio(wav_path, language=language, draft=draft)
 
     chunk_frames = max(1, int(fr * chunk_sec))
     parts: List[str] = []
@@ -416,7 +589,7 @@ def transcribe_wav_in_chunks(transcriber: "AudioTranscriberWithMetrics", wav_pat
                 cw.setsampwidth(sw)
                 cw.setframerate(fr)
                 cw.writeframes(chunk_data)
-            parts.append(transcriber.transcribe_audio(tmp_path, language=language))
+            parts.append(transcriber.transcribe_audio(tmp_path, language=language, draft=draft))
         finally:
             if tmp_path and os.path.isfile(tmp_path):
                 try:
@@ -529,7 +702,7 @@ if "webrtc_shared" not in st.session_state:
         "pcm_accum": bytearray(),
         "live_whisper_text": "",
         "live_whisper_error": None,
-        "live_whisper_last_processed_pcm_len": 0,
+        "live_draft_pcm_committed": 0,
     }
 else:
     _w = st.session_state.webrtc_shared
@@ -537,14 +710,13 @@ else:
     _w.setdefault("asr_lock", threading.Lock())
     _w.setdefault("live_whisper_text", "")
     _w.setdefault("live_whisper_error", None)
-    _w.setdefault("live_whisper_last_processed_pcm_len", 0)
+    _w.setdefault("live_draft_pcm_committed", 0)
+    _w.pop("live_whisper_last_processed_pcm_len", None)
 
 if "live_transcript_editor" not in st.session_state:
     st.session_state.live_transcript_editor = ""
 if "transcript_user_dirty" not in st.session_state:
     st.session_state.transcript_user_dirty = False
-if "finalize_without_whisper" not in st.session_state:
-    st.session_state.finalize_without_whisper = False
 
 # ============ CLASSES FROM YOUR COLAB ============
 
@@ -585,6 +757,8 @@ class AudioTranscriberWithMetrics:
                 st.stop()
             self.use_faster_whisper = True
             self.use_transformers = False
+            self._draft_beam_size = resolve_draft_beam_size()
+            self._draft_vad_filter = resolve_draft_vad_filter()
         elif hub_model_id:
             if not TRANSFORMERS_AVAILABLE:
                 st.error("Пакет transformers необходим для дообученной модели с Hub (режим PyTorch).")
@@ -631,21 +805,27 @@ class AudioTranscriberWithMetrics:
             self.use_faster_whisper = False
             self.model.to(self.device)
             self.model.eval()
+            self._draft_beam_size = resolve_draft_beam_size()
+            self._draft_vad_filter = resolve_draft_vad_filter()
         else:
             if not silent_ui:
                 st.info(f"Загрузка базовой модели Whisper ({model_size})...")
             self.model = _load_openai_whisper_cached(model_size)
             self.use_transformers = False
             self.use_faster_whisper = False
+            self._draft_beam_size = 1
+            self._draft_vad_filter = False
 
-    def transcribe_audio(self, audio_path, language='ru'):
-        """Транскрибация аудиофайла"""
+    def transcribe_audio(self, audio_path, language="ru", *, draft: bool = False):
+        """Транскрибация аудиофайла. draft=True — быстрые настройки для live-кусков (только faster-whisper)."""
         if getattr(self, "use_faster_whisper", False):
+            beam = getattr(self, "_draft_beam_size", 1) if draft else 5
+            vad = getattr(self, "_draft_vad_filter", True) if draft else False
             segments, _info = self.faster_model.transcribe(
                 audio_path,
                 language=language,
-                beam_size=5,
-                vad_filter=False,
+                beam_size=beam,
+                vad_filter=vad,
             )
             return "".join(seg.text for seg in segments).strip()
 
@@ -815,7 +995,7 @@ if st.session_state.pop("_pending_webrtc_full_reset", False):
             st.session_state.webrtc_shared["pcm_accum"] = bytearray()
             st.session_state.webrtc_shared["live_whisper_text"] = ""
             st.session_state.webrtc_shared["live_whisper_error"] = None
-            st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
+            st.session_state.webrtc_shared["live_draft_pcm_committed"] = 0
     st.session_state.live_transcript_editor = ""
     st.session_state.transcript_user_dirty = False
 
@@ -860,7 +1040,7 @@ def _webrtc_status_fragment():
             err = sh.get("live_whisper_error")
     _iv = resolve_live_whisper_interval_sec()
     st.caption(
-        f"Накоплено под Whisper: **~{sec:.1f}** с. Черновик Whisper обновляется примерно каждые **{_iv:g}** с."
+        f"Накоплено под Whisper: **~{sec:.1f}** с. Инкрементальный черновик — тик примерно каждые **{_iv:g}** с."
     )
     if err:
         st.error(err)
@@ -872,13 +1052,52 @@ if st.button("Сбросить запись и черновик", key="webrtc_re
     st.session_state._pending_webrtc_full_reset = True
     st.rerun()
 
-st.checkbox(
-    "Использовать текст из поля выше без повторного Whisper",
-    key="finalize_without_whisper",
-    help="Быстрый путь: протокол строится по тексту из поля транскрипта без повторной транскрибации аудио.",
-)
+_max_seg_b = int(resolve_draft_tail_max_seconds() * 32000)
+_overlap_b = int(resolve_draft_tail_overlap_sec() * 32000)
 
-if st.button("Транскрибировать и заполнить протокол", type="primary"):
+with st.expander("Дополнительно: полный Whisper по накопленному буферу", expanded=False):
+    st.caption(
+        "Один медленный прогон по всему PCM (beam 5). Результат для справки; основная кнопка ниже "
+        "строит протокол по live-транскрипту и короткому догону хвоста."
+    )
+    if st.button("Запустить полный Whisper по буферу", key="full_buffer_whisper_once"):
+        _sh = st.session_state.webrtc_shared
+        _lk = _sh.get("lock")
+        _al = _sh.get("asr_lock")
+        _pcm = b""
+        if _lk:
+            with _lk:
+                _pcm = bytes(_sh.get("pcm_accum") or b"")
+        if len(_pcm) < 3200:
+            st.warning("В буфере слишком мало аудио (меньше ~0,1 с).")
+        else:
+            _path = None
+            try:
+                fd, _path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                with open(_path, "wb") as wf:
+                    wf.write(pcm_mono_s16le_to_wav_bytes(_pcm))
+                with st.spinner("Полная транскрибация…"):
+                    if _al:
+                        with _al:
+                            _full_txt = transcribe_wav_in_chunks(
+                                _asr_transcriber, _path, language="ru", draft=False
+                            )
+                    else:
+                        _full_txt = transcribe_wav_in_chunks(
+                            _asr_transcriber, _path, language="ru", draft=False
+                        )
+                st.code(_full_txt or "—", language=None)
+            except Exception as e:
+                st.error(str(e))
+            finally:
+                if _path and os.path.isfile(_path):
+                    try:
+                        os.remove(_path)
+                    except OSError:
+                        pass
+
+if st.button("Заполнить протокол по транскрипту", type="primary"):
     if not yandex_llm_configured():
         st.error(
             "Не заданы параметры для заполнения протокола: укажите "
@@ -889,52 +1108,32 @@ if st.button("Транскрибировать и заполнить прото�
 
     sh = st.session_state.webrtc_shared
     lk = sh.get("lock")
-    asr_lock = sh.get("asr_lock")
-    skip_whisper = bool(st.session_state.get("finalize_without_whisper"))
+    asr_lock = sh.get("asr_lock") or threading.Lock()
+
+    with st.spinner("Дораспознавание хвоста записи…"):
+        flush_err = flush_incremental_pcm_tail(
+            sh, _asr_transcriber, asr_lock, _max_seg_b, _overlap_b
+        )
+    if flush_err:
+        st.error(flush_err)
+        st.stop()
+
+    if not st.session_state.get("transcript_user_dirty") and lk:
+        with lk:
+            _live_sync = (st.session_state.webrtc_shared.get("live_whisper_text") or "").strip()
+        st.session_state.live_transcript_editor = _live_sync
+
     editor_raw = (st.session_state.get("live_transcript_editor") or "").strip()
-
-    if skip_whisper and editor_raw:
-        transcription = (st.session_state.get("live_transcript_editor") or "").strip()
-    else:
-        if skip_whisper and not editor_raw:
-            st.error("В поле транскрипта нет текста. Снимите галочку или введите текст.")
-            st.stop()
-
-        pcm = b""
-        if lk:
-            with lk:
-                pcm = bytes(sh.get("pcm_accum") or b"")
-
-        if len(pcm) < 32000:
-            st.error("Включите запись в блоке выше и наговорите хотя бы около секунды.")
-            st.stop()
-
-        wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
-        merged_path = None
-        try:
-            fd, merged_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            with open(merged_path, "wb") as wf:
-                wf.write(wav_bytes)
-            with st.spinner("Транскрибация... Это может занять несколько минут."):
-                if asr_lock:
-                    with asr_lock:
-                        transcription = transcribe_wav_in_chunks(
-                            _asr_transcriber, merged_path, language="ru"
-                        )
-                else:
-                    transcription = transcribe_wav_in_chunks(
-                        _asr_transcriber, merged_path, language="ru"
-                    )
-        except Exception as e:
-            st.error(f"Ошибка транскрибации: {e}")
-            st.stop()
-        finally:
-            if merged_path and os.path.isfile(merged_path):
-                try:
-                    os.remove(merged_path)
-                except OSError:
-                    pass
+    live_raw = ""
+    if lk:
+        with lk:
+            live_raw = (sh.get("live_whisper_text") or "").strip()
+    transcription = editor_raw if editor_raw else live_raw
+    if not transcription:
+        st.error(
+            "Нет текста для протокола: сначала запишите консультацию (или вставьте текст в поле транскрипта)."
+        )
+        st.stop()
 
     st.session_state.original_transcription = transcription
     st.session_state.doctor_transcript_editor = transcription
@@ -959,7 +1158,7 @@ if st.button("Транскрибировать и заполнить прото�
                 st.session_state.webrtc_shared["pcm_accum"] = bytearray()
                 st.session_state.webrtc_shared["live_whisper_text"] = ""
                 st.session_state.webrtc_shared["live_whisper_error"] = None
-                st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
+                st.session_state.webrtc_shared["live_draft_pcm_committed"] = 0
         st.session_state.transcript_user_dirty = False
     except Exception as e:
         st.error(f"Ошибка заполнения протокола: {e}")

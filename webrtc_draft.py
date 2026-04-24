@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Обработчик аудио WebRTC → PCM (буфер для Whisper) и фоновый периодический черновик Whisper."""
+"""Обработчик аудио WebRTC → PCM и инкрементальный live-Whisper по хвосту буфера."""
 
 from __future__ import annotations
 
@@ -56,20 +56,33 @@ def pcm_mono_s16le_to_wav_bytes(pcm: bytes, sample_rate: int = TARGET_SAMPLE_RAT
 
 
 class DraftAudioProcessor(AudioProcessorBase):
-    """Принимает очередь AudioFrame: накапливает PCM и периодически обновляет черновик Whisper."""
+    """Принимает очередь AudioFrame: накапливает PCM и инкрементально дополняет live_whisper_text."""
 
     def __init__(
         self,
         shared: Dict[str, Any],
         transcribe_pcm: Callable[[bytes], Tuple[str, Optional[str]]],
         interval_sec: float,
+        max_segment_bytes: int,
+        min_new_bytes: int,
+        overlap_bytes: int = 0,
     ) -> None:
         super().__init__()
         self._shared = shared
         self._transcribe_pcm = transcribe_pcm
         self._interval = max(1.0, float(interval_sec))
+        self._max_segment_bytes = max(3200, int(max_segment_bytes))
+        self._min_new_bytes = max(1, int(min_new_bytes))
+        self._overlap_bytes = max(0, int(overlap_bytes))
         self._stop = threading.Event()
         self._resampler: Optional[object] = None
+        lk = shared.get("lock")
+        if lk:
+            with lk:
+                shared["live_draft_pcm_committed"] = 0
+                shared["live_whisper_text"] = ""
+                shared["live_whisper_error"] = None
+                shared.pop("live_whisper_last_processed_pcm_len", None)
         self._thread = threading.Thread(target=self._live_whisper_loop, daemon=True)
         self._thread.start()
 
@@ -86,8 +99,6 @@ class DraftAudioProcessor(AudioProcessorBase):
             acc.extend(pcm)
 
     def _live_whisper_loop(self) -> None:
-        # 16 kHz mono s16le → 32000 байт/с; минимум ~1 с нового аудио с прошлого прогона
-        min_new_bytes = 32000
         lk = self._shared.get("lock")
         if not lk:
             return
@@ -95,21 +106,31 @@ class DraftAudioProcessor(AudioProcessorBase):
             if self._stop.wait(self._interval):
                 break
             with lk:
-                last_len = int(self._shared.get("live_whisper_last_processed_pcm_len") or 0)
                 pcm = bytes(self._shared.get("pcm_accum") or b"")
+                committed = int(self._shared.get("live_draft_pcm_committed") or 0)
             n = len(pcm)
-            if n - last_len < min_new_bytes:
+            if n - committed < self._min_new_bytes:
                 continue
-            text, err = self._transcribe_pcm(pcm)
+            take = min(n - committed, self._max_segment_bytes)
+            ov = min(self._overlap_bytes, committed)
+            start = committed - ov
+            chunk = pcm[start : committed + take]
+            text, err = self._transcribe_pcm(chunk)
             if self._stop.is_set():
                 break
             with lk:
-                self._shared["live_whisper_last_processed_pcm_len"] = n
                 if err:
                     self._shared["live_whisper_error"] = err
-                else:
-                    self._shared["live_whisper_error"] = None
-                    self._shared["live_whisper_text"] = text
+                    continue
+                self._shared["live_whisper_error"] = None
+                prev = (self._shared.get("live_whisper_text") or "").strip()
+                t = (text or "").strip()
+                if t:
+                    if prev:
+                        self._shared["live_whisper_text"] = (prev + " " + t).strip()
+                    else:
+                        self._shared["live_whisper_text"] = t
+                self._shared["live_draft_pcm_committed"] = committed + take
 
     async def recv_queued(self, frames: List[av.AudioFrame]) -> List[av.AudioFrame]:
         if not frames:
