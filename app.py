@@ -27,8 +27,6 @@ def _patch_streamlit_safe_session_state_for_webrtc_cache_clear() -> None:
     if getattr(cls, "_clinvoice_webrtc_ss_clear_patch", False):
         return
 
-    _orig_getitem = cls.__getitem__
-
     def __getitem__(self, key: str):
         self._yield_callback()
         with self._lock:
@@ -871,24 +869,38 @@ def hf_hub_download_dir() -> str:
     )
 
 
-@st.cache_resource(show_spinner=False)
+# Не через @st.cache_resource: пункт меню «Clear cache» сбрасывает только st.cache_*,
+# а экземпляр распознавателя живёт в session_state — после очистки оставалась «живая»
+# ссылка на уже уничтоженную модель и запись переставала накапливаться.
+_clinvoice_model_load_lock = threading.Lock()
+_clinvoice_fw_whisper_models: dict[tuple[str, str, str], object] = {}
+_clinvoice_openai_whisper_models: dict[tuple[str, str], object] = {}
+
+
 def _load_faster_whisper_cached(repo_id: str, device_kw: str, compute_type: str):
     from faster_whisper import WhisperModel
 
-    return WhisperModel(
-        repo_id,
-        device=device_kw,
-        compute_type=compute_type,
-        download_root=hf_hub_download_dir(),
-    )
+    k = (str(repo_id), str(device_kw), str(compute_type))
+    with _clinvoice_model_load_lock:
+        if k not in _clinvoice_fw_whisper_models:
+            _clinvoice_fw_whisper_models[k] = WhisperModel(
+                repo_id,
+                device=device_kw,
+                compute_type=compute_type,
+                download_root=hf_hub_download_dir(),
+            )
+        return _clinvoice_fw_whisper_models[k]
 
 
-@st.cache_resource(show_spinner=False)
 def _load_openai_whisper_cached(model_size: str):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    return whisper.load_model(
-        model_size, device=dev, download_root=openai_whisper_download_dir()
-    )
+    k = (str(model_size), dev)
+    with _clinvoice_model_load_lock:
+        if k not in _clinvoice_openai_whisper_models:
+            _clinvoice_openai_whisper_models[k] = whisper.load_model(
+                model_size, device=dev, download_root=openai_whisper_download_dir()
+            )
+        return _clinvoice_openai_whisper_models[k]
 
 
 # Page config
@@ -1161,6 +1173,12 @@ hub_model_id = resolve_hub_model_id()
 model_size = "small"
 
 st.header("Запись консультации")
+st.caption(
+    "Меню **⋮** → **Clear cache** сбрасывает только кэш функций Streamlit (`@st.cache_data` / "
+    "`@st.cache_resource`); текст диалога про это — штатное поведение Streamlit. "
+    "Чтобы сбросить поля приложения и буфер записи, используйте **Clear session state** "
+    "(или кнопку «Сбросить запись…» на странице)."
+)
 if "original_transcription" not in st.session_state:
     st.session_state.original_transcription = None
 if "protocol_editor_text" not in st.session_state:
