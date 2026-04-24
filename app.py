@@ -59,7 +59,7 @@ import whisper
 from docx import Document
 import torch
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
@@ -198,6 +198,30 @@ DEFAULT_HF_FINETUNED_REPO = "Ignites/fine_tuned_med_whisper_rus"
 DEFAULT_ASR_CHUNK_SECONDS = 30.0
 
 
+def resolve_live_whisper_interval_sec() -> float:
+    """
+    Период полного чернового прогона Whisper по нарастающему PCM (секунды).
+    Задаётся **CLINVOICE_LIVE_WHISPER_INTERVAL_SEC** (env или Streamlit Secrets).
+    По умолчанию 12; значение ограничивается диапазоном [10, 15].
+    """
+    raw = (os.environ.get("CLINVOICE_LIVE_WHISPER_INTERVAL_SEC") or "").strip()
+    if not raw:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_LIVE_WHISPER_INTERVAL_SEC" in st.secrets:
+                raw = str(st.secrets["CLINVOICE_LIVE_WHISPER_INTERVAL_SEC"]).strip()
+        except Exception:
+            pass
+    default = 12.0
+    if not raw:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = default
+    return max(10.0, min(15.0, v))
+
+
 def _ice_server_key(entry: dict) -> str:
     u = entry.get("urls")
     if isinstance(u, list):
@@ -280,18 +304,52 @@ WEBRTC_UI_RU: dict = {
 }
 
 
-def build_speechkit_processor_factory():
+def get_cached_asr_transcriber(model_size: str, hub_model_id: str) -> "AudioTranscriberWithMetrics":
+    """Один экземпляр распознавателя на (hub, model_size) для финала и фонового черновика."""
+    safe = (hub_model_id or "").replace("/", "_")
+    cache_key = f"_clinvoice_asr_{safe}_{model_size}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = AudioTranscriberWithMetrics(
+            model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
+        )
+    return st.session_state[cache_key]
+
+
+def build_webrtc_processor_factory(
+    transcriber: "AudioTranscriberWithMetrics",
+    interval_sec: float,
+):
     """
-    Вызывать из основного потока Streamlit. Возвращает фабрику без обращения к
-    session_state внутри worker WebRTC.
+    Вызывать из основного потока Streamlit. Фабрика без обращения к session_state
+    внутри worker WebRTC — только замыкание на готовый shared и transcriber.
     """
-    shared = st.session_state.speechkit_shared
-    api_key = resolve_yandex_api_key()
-    folder_id = resolve_yandex_folder_id()
-    iam_token = resolve_yandex_iam_token()
+    shared = st.session_state.webrtc_shared
+    asr_lock = shared["asr_lock"]
+
+    def _transcribe_pcm(pcm: bytes) -> Tuple[str, Optional[str]]:
+        if not pcm:
+            return "", None
+        merged_path = None
+        try:
+            fd, merged_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
+            with open(merged_path, "wb") as wf:
+                wf.write(wav_bytes)
+            with asr_lock:
+                text = transcribe_wav_in_chunks(transcriber, merged_path, language="ru")
+            return text, None
+        except Exception as e:
+            return "", str(e)
+        finally:
+            if merged_path and os.path.isfile(merged_path):
+                try:
+                    os.remove(merged_path)
+                except OSError:
+                    pass
 
     def _factory():
-        return DraftAudioProcessor(shared, api_key, folder_id, iam_token)
+        return DraftAudioProcessor(shared, _transcribe_pcm, interval_sec)
 
     return _factory
 
@@ -464,15 +522,29 @@ st.set_page_config(
 
 # До любых виджетов: WebRTC вызывает audio_processor_factory из фонового потока,
 # там нельзя обращаться к st.session_state — только замыкание на готовый dict.
-if "speechkit_shared" not in st.session_state:
-    st.session_state.speechkit_shared = {
-        "draft": "",
-        "error": None,
+if "webrtc_shared" not in st.session_state:
+    st.session_state.webrtc_shared = {
         "lock": threading.Lock(),
+        "asr_lock": threading.Lock(),
         "pcm_accum": bytearray(),
+        "live_whisper_text": "",
+        "live_whisper_error": None,
+        "live_whisper_last_processed_pcm_len": 0,
     }
 else:
-    st.session_state.speechkit_shared.setdefault("pcm_accum", bytearray())
+    _w = st.session_state.webrtc_shared
+    _w.setdefault("pcm_accum", bytearray())
+    _w.setdefault("asr_lock", threading.Lock())
+    _w.setdefault("live_whisper_text", "")
+    _w.setdefault("live_whisper_error", None)
+    _w.setdefault("live_whisper_last_processed_pcm_len", 0)
+
+if "live_transcript_editor" not in st.session_state:
+    st.session_state.live_transcript_editor = ""
+if "transcript_user_dirty" not in st.session_state:
+    st.session_state.transcript_user_dirty = False
+if "finalize_without_whisper" not in st.session_state:
+    st.session_state.finalize_without_whisper = False
 
 # ============ CLASSES FROM YOUR COLAB ============
 
@@ -702,46 +774,95 @@ if "original_transcription" not in st.session_state:
 if "protocol_editor_text" not in st.session_state:
     st.session_state.protocol_editor_text = ""
 
+
+def _mark_live_transcript_dirty() -> None:
+    st.session_state.transcript_user_dirty = True
+
+
+def _sync_live_transcript_from_whisper() -> None:
+    if st.session_state.get("transcript_user_dirty"):
+        return
+    lk = st.session_state.webrtc_shared.get("lock")
+    if not lk:
+        return
+    with lk:
+        live = st.session_state.webrtc_shared.get("live_whisper_text") or ""
+    current = (st.session_state.get("live_transcript_editor") or "").strip()
+    # После успешного финала буфер и черновик очищаются — не затирать поле пустым черновиком.
+    if not live.strip() and current:
+        return
+    st.session_state.live_transcript_editor = live
+
+
+_live_interval = resolve_live_whisper_interval_sec()
+_asr_transcriber = get_cached_asr_transcriber(model_size, hub_model_id)
+
 webrtc_streamer(
-    key="clinvoice_speechkit_mic",
+    key="clinvoice_webrtc_mic",
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=resolve_webrtc_rtc_configuration(),
     media_stream_constraints={"audio": True, "video": False},
-    audio_processor_factory=build_speechkit_processor_factory(),
+    audio_processor_factory=build_webrtc_processor_factory(_asr_transcriber, _live_interval),
     async_processing=True,
     sendback_audio=False,
     translations=WEBRTC_UI_RU,
 )
 
+_sync_live_transcript_from_whisper()
+st.text_area(
+    "Транскрипт (можно править во время записи)",
+    height=160,
+    key="live_transcript_editor",
+    on_change=_mark_live_transcript_dirty,
+    help="Пока вы не меняли текст вручную, сюда подставляется черновик Whisper. "
+    "После правки используйте кнопку ниже, чтобы снова подставить последний авто-текст.",
+)
+if st.button("Подставить последний авто-текст", key="apply_live_whisper_to_editor"):
+    _lk = st.session_state.webrtc_shared.get("lock")
+    if _lk:
+        with _lk:
+            auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
+        st.session_state.live_transcript_editor = auto
+        st.session_state.transcript_user_dirty = False
+        st.rerun()
+
 @st.fragment(run_every=timedelta(milliseconds=450))
 def _webrtc_status_fragment():
-    sh = st.session_state.speechkit_shared
+    sh = st.session_state.webrtc_shared
     lk = sh.get("lock")
     sec = 0.0
-    draft = ""
     err: Optional[str] = None
     if lk:
         with lk:
             sec = len(sh.get("pcm_accum") or b"") / 32000.0
-            draft = sh.get("draft") or ""
-            err = sh.get("error")
-    st.caption(f"Накоплено под Whisper: **~{sec:.1f}** с.")
+            err = sh.get("live_whisper_error")
+    _iv = resolve_live_whisper_interval_sec()
+    st.caption(
+        f"Накоплено под Whisper: **~{sec:.1f}** с. Черновик Whisper обновляется примерно каждые **{_iv:g}** с."
+    )
     if err:
         st.error(err)
-    elif draft.strip():
-        st.info(draft)
 
 
 _webrtc_status_fragment()
 
 if st.button("Сбросить запись и черновик", key="webrtc_reset_buffer"):
-    lk = st.session_state.speechkit_shared.get("lock")
+    lk = st.session_state.webrtc_shared.get("lock")
     if lk:
         with lk:
-            st.session_state.speechkit_shared["pcm_accum"] = bytearray()
-            st.session_state.speechkit_shared["draft"] = ""
-            st.session_state.speechkit_shared["error"] = None
+            st.session_state.webrtc_shared["pcm_accum"] = bytearray()
+            st.session_state.webrtc_shared["live_whisper_text"] = ""
+            st.session_state.webrtc_shared["live_whisper_error"] = None
+            st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
+    st.session_state.live_transcript_editor = ""
+    st.session_state.transcript_user_dirty = False
     st.rerun()
+
+st.checkbox(
+    "Использовать текст из поля выше без повторного Whisper",
+    key="finalize_without_whisper",
+    help="Быстрый путь: протокол строится по тексту из поля транскрипта без повторной транскрибации аудио.",
+)
 
 if st.button("Транскрибировать и заполнить протокол", type="primary"):
     if not yandex_llm_configured():
@@ -752,38 +873,54 @@ if st.button("Транскрибировать и заполнить прото�
         )
         st.stop()
 
-    sh = st.session_state.speechkit_shared
+    sh = st.session_state.webrtc_shared
     lk = sh.get("lock")
-    pcm = b""
-    if lk:
-        with lk:
-            pcm = bytes(sh.get("pcm_accum") or b"")
+    asr_lock = sh.get("asr_lock")
+    skip_whisper = bool(st.session_state.get("finalize_without_whisper"))
+    editor_raw = (st.session_state.get("live_transcript_editor") or "").strip()
 
-    if len(pcm) < 32000:
-        st.error("Включите запись в блоке выше и наговорите хотя бы около секунды.")
-        st.stop()
+    if skip_whisper and editor_raw:
+        transcription = (st.session_state.get("live_transcript_editor") or "").strip()
+    else:
+        if skip_whisper and not editor_raw:
+            st.error("В поле транскрипта нет текста. Снимите галочку или введите текст.")
+            st.stop()
 
-    wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
-    merged_path = None
-    try:
-        fd, merged_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        with open(merged_path, "wb") as wf:
-            wf.write(wav_bytes)
-        with st.spinner("Транскрибация... Это может занять несколько минут."):
-            transcriber = AudioTranscriberWithMetrics(
-                model_size=model_size, hub_model_id=hub_model_id, silent_ui=True
-            )
-            transcription = transcribe_wav_in_chunks(transcriber, merged_path, language="ru")
-    except Exception as e:
-        st.error(f"Ошибка транскрибации: {e}")
-        st.stop()
-    finally:
-        if merged_path and os.path.isfile(merged_path):
-            try:
-                os.remove(merged_path)
-            except OSError:
-                pass
+        pcm = b""
+        if lk:
+            with lk:
+                pcm = bytes(sh.get("pcm_accum") or b"")
+
+        if len(pcm) < 32000:
+            st.error("Включите запись в блоке выше и наговорите хотя бы около секунды.")
+            st.stop()
+
+        wav_bytes = pcm_mono_s16le_to_wav_bytes(pcm)
+        merged_path = None
+        try:
+            fd, merged_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            with open(merged_path, "wb") as wf:
+                wf.write(wav_bytes)
+            with st.spinner("Транскрибация... Это может занять несколько минут."):
+                if asr_lock:
+                    with asr_lock:
+                        transcription = transcribe_wav_in_chunks(
+                            _asr_transcriber, merged_path, language="ru"
+                        )
+                else:
+                    transcription = transcribe_wav_in_chunks(
+                        _asr_transcriber, merged_path, language="ru"
+                    )
+        except Exception as e:
+            st.error(f"Ошибка транскрибации: {e}")
+            st.stop()
+        finally:
+            if merged_path and os.path.isfile(merged_path):
+                try:
+                    os.remove(merged_path)
+                except OSError:
+                    pass
 
     st.session_state.original_transcription = transcription
     st.session_state.doctor_transcript_editor = transcription
@@ -799,22 +936,17 @@ if st.button("Транскрибировать и заполнить прото�
         st.success(
             "Готово. Проверьте и при необходимости отредактируйте протокол ниже. "
             "Текст протокола должен сохраниться автоматически как **протокол.txt**; "
-            "если окно загрузки не появилось, нажмите кнопку здесь или ниже в блоке протокола."
+            "если загрузка не началась, скачайте файл кнопкой в блоке протокола."
         )
         _auto_txt = build_structured_protocol_txt(protocol, st.session_state.protocol_consultation_date)
-        st.download_button(
-            "Скачать протокол (.txt)",
-            _auto_txt.encode("utf-8"),
-            "протокол.txt",
-            "text/plain",
-            key="prot_txt_right_after_success",
-        )
         trigger_browser_text_download("протокол.txt", _auto_txt)
         if lk:
             with lk:
-                st.session_state.speechkit_shared["pcm_accum"] = bytearray()
-                st.session_state.speechkit_shared["draft"] = ""
-                st.session_state.speechkit_shared["error"] = None
+                st.session_state.webrtc_shared["pcm_accum"] = bytearray()
+                st.session_state.webrtc_shared["live_whisper_text"] = ""
+                st.session_state.webrtc_shared["live_whisper_error"] = None
+                st.session_state.webrtc_shared["live_whisper_last_processed_pcm_len"] = 0
+        st.session_state.transcript_user_dirty = False
     except Exception as e:
         st.error(f"Ошибка заполнения протокола: {e}")
         st.session_state.protocol_editor_text = format_protocol_editor_text(
