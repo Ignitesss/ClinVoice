@@ -1174,9 +1174,7 @@ model_size = "small"
 
 st.header("Запись консультации")
 st.caption(
-    "Меню **⋮** → **Clear cache** сбрасывает только кэш функций Streamlit (`@st.cache_data` / "
-    "`@st.cache_resource`); текст диалога про это — штатное поведение Streamlit. "
-    "Чтобы сбросить поля приложения и буфер записи, используйте **Clear session state** "
+    "Чтобы сбросить поля приложения и буфер записи, используйте Clear session state "
     "(или кнопку «Сбросить запись…» на странице)."
 )
 if "original_transcription" not in st.session_state:
