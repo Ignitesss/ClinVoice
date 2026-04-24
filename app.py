@@ -242,7 +242,7 @@ def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
         "stun:stun4.l.google.com:19302",
         "stun:stun.cloudflare.com:3478",
         "stun:stun.services.mozilla.com:3478",
-        "stun:global.stun.twilio.com:3478?transport=udp",
+        "stun:global.stun.twilio.com:3478",
     ):
         add({"urls": u})
 
@@ -677,17 +677,6 @@ webrtc_streamer(
     async_processing=True,
     sendback_audio=False,
 )
-
-with st.expander("Долго «Connection…» или не растёт буфер записи", expanded=False):
-    st.markdown(
-        "Часто не хватает **TURN** (relay), не только STUN. Варианты:\n"
-        "1. В **Secrets** приложения задайте **`HF_TOKEN`** (токен Hugging Face) — "
-        "`streamlit-webrtc` подтянет TURN от Hugging Face (см. их документацию).\n"
-        "2. Или **`TWILIO_ACCOUNT_SID`** + **`TWILIO_AUTH_TOKEN`** для Twilio ICE.\n"
-        "3. Или переменная / секрет **`CLINVOICE_WEBRTC_ICE_SERVERS_JSON`**: JSON-массив объектов "
-        "`{ \"urls\": \"…\", \"username\": \"…\", \"credential\": \"…\" }` для вашего TURN.\n\n"
-        "После изменения Secrets перезапустите приложение."
-    )
 
 @st.fragment(run_every=timedelta(milliseconds=450))
 def _webrtc_status_fragment():
