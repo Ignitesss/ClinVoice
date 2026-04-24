@@ -715,8 +715,8 @@ else:
 
 if "live_transcript_editor" not in st.session_state:
     st.session_state.live_transcript_editor = ""
-if "transcript_user_dirty" not in st.session_state:
-    st.session_state.transcript_user_dirty = False
+if "live_transcript_pause_auto_sync" not in st.session_state:
+    st.session_state.live_transcript_pause_auto_sync = False
 
 # ============ CLASSES FROM YOUR COLAB ============
 
@@ -955,12 +955,8 @@ if "protocol_editor_text" not in st.session_state:
     st.session_state.protocol_editor_text = ""
 
 
-def _mark_live_transcript_dirty() -> None:
-    st.session_state.transcript_user_dirty = True
-
-
 def _sync_live_transcript_from_whisper() -> None:
-    if st.session_state.get("transcript_user_dirty"):
+    if st.session_state.get("live_transcript_pause_auto_sync"):
         return
     lk = st.session_state.webrtc_shared.get("lock")
     if not lk:
@@ -997,7 +993,7 @@ if st.session_state.pop("_pending_webrtc_full_reset", False):
             st.session_state.webrtc_shared["live_whisper_error"] = None
             st.session_state.webrtc_shared["live_draft_pcm_committed"] = 0
     st.session_state.live_transcript_editor = ""
-    st.session_state.transcript_user_dirty = False
+    st.session_state.live_transcript_pause_auto_sync = False
 
 if st.session_state.pop("_pending_apply_live_whisper", False):
     _alk = st.session_state.webrtc_shared.get("lock")
@@ -1006,30 +1002,32 @@ if st.session_state.pop("_pending_apply_live_whisper", False):
         with _alk:
             _auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
     st.session_state.live_transcript_editor = _auto
-    st.session_state.transcript_user_dirty = False
+    st.session_state.live_transcript_pause_auto_sync = False
 
 
-@st.fragment(run_every=timedelta(milliseconds=650))
-def _live_transcript_fragment():
-    """Периодически подтягивает черновик Whisper в поле (полный скрипт при этом не перезапускается)."""
+@st.fragment(run_every=timedelta(milliseconds=400))
+def _live_transcript_ui_fragment():
+    """
+    Один фрагмент с run_every: подтягивает live_whisper_text в поле и обновляет статус.
+    Без on_change у text_area — иначе Streamlit может помечать поле как изменённое при
+    программной подстановке и блокировать авто-синхронизацию.
+    """
     _sync_live_transcript_from_whisper()
+    st.checkbox(
+        "Остановить авто-подстановку черновика (для ручного редактирования без перезаписи)",
+        key="live_transcript_pause_auto_sync",
+        help="Пока включено, текст в поле не обновляется из Whisper; используйте «Подставить последний авто-текст».",
+    )
     st.text_area(
         "Транскрипт (можно править во время записи)",
         height=160,
         key="live_transcript_editor",
-        on_change=_mark_live_transcript_dirty,
-        help="Пока вы не меняли текст вручную, сюда подставляется черновик Whisper. "
-        "После правки используйте кнопку ниже, чтобы снова подставить последний авто-текст.",
+        help="Автоматически повторяет накопленный черновик Whisper, пока не включена остановка выше.",
     )
     if st.button("Подставить последний авто-текст", key="apply_live_whisper_to_editor"):
         st.session_state._pending_apply_live_whisper = True
         st.rerun()
 
-
-_live_transcript_fragment()
-
-@st.fragment(run_every=timedelta(milliseconds=450))
-def _webrtc_status_fragment():
     sh = st.session_state.webrtc_shared
     lk = sh.get("lock")
     sec = 0.0
@@ -1046,7 +1044,7 @@ def _webrtc_status_fragment():
         st.error(err)
 
 
-_webrtc_status_fragment()
+_live_transcript_ui_fragment()
 
 if st.button("Сбросить запись и черновик", key="webrtc_reset_buffer"):
     st.session_state._pending_webrtc_full_reset = True
@@ -1118,7 +1116,7 @@ if st.button("Заполнить протокол по транскрипту", 
         st.error(flush_err)
         st.stop()
 
-    if not st.session_state.get("transcript_user_dirty") and lk:
+    if not st.session_state.get("live_transcript_pause_auto_sync") and lk:
         with lk:
             _live_sync = (st.session_state.webrtc_shared.get("live_whisper_text") or "").strip()
         st.session_state.live_transcript_editor = _live_sync
@@ -1159,7 +1157,7 @@ if st.button("Заполнить протокол по транскрипту", 
                 st.session_state.webrtc_shared["live_whisper_text"] = ""
                 st.session_state.webrtc_shared["live_whisper_error"] = None
                 st.session_state.webrtc_shared["live_draft_pcm_committed"] = 0
-        st.session_state.transcript_user_dirty = False
+        st.session_state.live_transcript_pause_auto_sync = False
     except Exception as e:
         st.error(f"Ошибка заполнения протокола: {e}")
         st.session_state.protocol_editor_text = format_protocol_editor_text(
