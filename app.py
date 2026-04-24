@@ -52,6 +52,7 @@ apply_disk_cache_layout(_APP_CACHE_ROOT)
 import base64
 import io
 import json
+import struct
 import tempfile
 import threading
 import wave
@@ -322,6 +323,117 @@ def resolve_draft_tail_overlap_sec() -> float:
     return max(0.0, min(3.0, v))
 
 
+def _secret_str(name: str) -> str:
+    try:
+        if hasattr(st, "secrets") and st.secrets and name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_faster_whisper_no_speech_threshold(*, draft: bool) -> float:
+    """
+    Порог «нет речи» для faster-whisper (выше — меньше галлюцинаций на тишине).
+    **CLINVOICE_DRAFT_NO_SPEECH_THRESHOLD** / **CLINVOICE_FINAL_NO_SPEECH_THRESHOLD** или общий
+    **CLINVOICE_WHISPER_NO_SPEECH_THRESHOLD** (env / Secrets). Диапазон [0.35, 0.95].
+    """
+    raw = (os.environ.get("CLINVOICE_WHISPER_NO_SPEECH_THRESHOLD") or "").strip()
+    if not raw:
+        raw = _secret_str("CLINVOICE_WHISPER_NO_SPEECH_THRESHOLD")
+    if draft:
+        dr = (os.environ.get("CLINVOICE_DRAFT_NO_SPEECH_THRESHOLD") or "").strip() or _secret_str(
+            "CLINVOICE_DRAFT_NO_SPEECH_THRESHOLD"
+        )
+        if dr:
+            raw = dr
+    else:
+        fn = (os.environ.get("CLINVOICE_FINAL_NO_SPEECH_THRESHOLD") or "").strip() or _secret_str(
+            "CLINVOICE_FINAL_NO_SPEECH_THRESHOLD"
+        )
+        if fn:
+            raw = fn
+    default = 0.72 if draft else 0.62
+    if not raw:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = default
+    return max(0.35, min(0.95, v))
+
+
+def _resolve_faster_whisper_compression_ratio(*, draft: bool) -> float:
+    """
+    Порог compression ratio (ниже — жёстче отсекать зацикленные галлюцинации).
+    **CLINVOICE_WHISPER_COMPRESSION_RATIO_THRESHOLD** или draft/final-суффиксы; [1.2, 3.5].
+    """
+    raw = (os.environ.get("CLINVOICE_WHISPER_COMPRESSION_RATIO_THRESHOLD") or "").strip()
+    if not raw:
+        raw = _secret_str("CLINVOICE_WHISPER_COMPRESSION_RATIO_THRESHOLD")
+    if draft:
+        dr = (os.environ.get("CLINVOICE_DRAFT_COMPRESSION_RATIO_THRESHOLD") or "").strip() or _secret_str(
+            "CLINVOICE_DRAFT_COMPRESSION_RATIO_THRESHOLD"
+        )
+        if dr:
+            raw = dr
+    else:
+        fn = (os.environ.get("CLINVOICE_FINAL_COMPRESSION_RATIO_THRESHOLD") or "").strip() or _secret_str(
+            "CLINVOICE_FINAL_COMPRESSION_RATIO_THRESHOLD"
+        )
+        if fn:
+            raw = fn
+    default = 2.0 if draft else 2.35
+    if not raw:
+        v = default
+    else:
+        try:
+            v = float(raw)
+        except ValueError:
+            v = default
+    return max(1.2, min(3.5, v))
+
+
+def _resolve_whisper_initial_prompt() -> str:
+    """Опциональный **CLINVOICE_WHISPER_INITIAL_PROMPT** — смещение к домену (короткая строка)."""
+    raw = (os.environ.get("CLINVOICE_WHISPER_INITIAL_PROMPT") or "").strip()
+    if not raw:
+        raw = _secret_str("CLINVOICE_WHISPER_INITIAL_PROMPT")
+    return (raw[:224] if raw else "").strip()
+
+
+def _resolve_draft_min_pcm_rms() -> float:
+    """
+    Если > 0, live-куски с RMS ниже порога не отправляются в Whisper (тишина).
+    **CLINVOICE_DRAFT_MIN_PCM_RMS**; 0 = выключено. Типичный старт 80–200 для int16.
+    """
+    raw = (os.environ.get("CLINVOICE_DRAFT_MIN_PCM_RMS") or "").strip()
+    if not raw:
+        raw = _secret_str("CLINVOICE_DRAFT_MIN_PCM_RMS")
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(5000.0, v))
+
+
+def _pcm_s16le_mono_rms(pcm: bytes) -> float:
+    """RMS по int16 little-endian mono."""
+    if len(pcm) < 2:
+        return 0.0
+    n = len(pcm) // 2
+    if n <= 0:
+        return 0.0
+    sum_sq = 0.0
+    for i in range(0, n * 2, 2):
+        s = struct.unpack_from("<h", pcm, i)[0]
+        sum_sq += float(s) * float(s)
+    return (sum_sq / float(n)) ** 0.5
+
+
 def _ice_server_key(entry: dict) -> str:
     u = entry.get("urls")
     if isinstance(u, list):
@@ -404,6 +516,31 @@ WEBRTC_UI_RU: dict = {
 }
 
 
+def ensure_webrtc_shared_initialized() -> None:
+    """
+    Восстанавливает webrtc_shared после очистки session state или при перезапуске
+    только @st.fragment(run_every=...), когда верх скрипта не выполняется.
+    """
+    w = st.session_state.get("webrtc_shared")
+    if not isinstance(w, dict):
+        st.session_state.webrtc_shared = {
+            "lock": threading.Lock(),
+            "asr_lock": threading.Lock(),
+            "pcm_accum": bytearray(),
+            "live_whisper_text": "",
+            "live_whisper_error": None,
+            "live_draft_pcm_committed": 0,
+        }
+        return
+    w.setdefault("lock", threading.Lock())
+    w.setdefault("pcm_accum", bytearray())
+    w.setdefault("asr_lock", threading.Lock())
+    w.setdefault("live_whisper_text", "")
+    w.setdefault("live_whisper_error", None)
+    w.setdefault("live_draft_pcm_committed", 0)
+    w.pop("live_whisper_last_processed_pcm_len", None)
+
+
 def get_cached_asr_transcriber(model_size: str, hub_model_id: str) -> "AudioTranscriberWithMetrics":
     """Один экземпляр распознавателя на (hub, model_size) для live-кусков и опционального полного прогона."""
     safe = (hub_model_id or "").replace("/", "_")
@@ -424,6 +561,10 @@ def transcribe_pcm_bytes_to_text(
     """PCM s16le mono 16k → временный WAV → Whisper (короткие срезы обычно без чанкования)."""
     if not pcm:
         return ""
+    if draft:
+        rms_floor = _resolve_draft_min_pcm_rms()
+        if rms_floor > 0.0 and _pcm_s16le_mono_rms(pcm) < rms_floor:
+            return ""
     merged_path = None
     try:
         fd, merged_path = tempfile.mkstemp(suffix=".wav")
@@ -492,6 +633,7 @@ def build_webrtc_processor_factory(
     Вызывать из основного потока Streamlit. Фабрика без обращения к session_state
     внутри worker WebRTC — только замыкание на готовый shared и transcriber.
     """
+    ensure_webrtc_shared_initialized()
     shared = st.session_state.webrtc_shared
     asr_lock = shared["asr_lock"]
     max_seg_b = int(resolve_draft_tail_max_seconds() * 32000)
@@ -695,23 +837,7 @@ st.set_page_config(
 
 # До любых виджетов: WebRTC вызывает audio_processor_factory из фонового потока,
 # там нельзя обращаться к st.session_state — только замыкание на готовый dict.
-if "webrtc_shared" not in st.session_state:
-    st.session_state.webrtc_shared = {
-        "lock": threading.Lock(),
-        "asr_lock": threading.Lock(),
-        "pcm_accum": bytearray(),
-        "live_whisper_text": "",
-        "live_whisper_error": None,
-        "live_draft_pcm_committed": 0,
-    }
-else:
-    _w = st.session_state.webrtc_shared
-    _w.setdefault("pcm_accum", bytearray())
-    _w.setdefault("asr_lock", threading.Lock())
-    _w.setdefault("live_whisper_text", "")
-    _w.setdefault("live_whisper_error", None)
-    _w.setdefault("live_draft_pcm_committed", 0)
-    _w.pop("live_whisper_last_processed_pcm_len", None)
+ensure_webrtc_shared_initialized()
 
 if "live_transcript_editor" not in st.session_state:
     st.session_state.live_transcript_editor = ""
@@ -759,6 +885,11 @@ class AudioTranscriberWithMetrics:
             self.use_transformers = False
             self._draft_beam_size = resolve_draft_beam_size()
             self._draft_vad_filter = resolve_draft_vad_filter()
+            self._fw_ns_draft = _resolve_faster_whisper_no_speech_threshold(draft=True)
+            self._fw_ns_final = _resolve_faster_whisper_no_speech_threshold(draft=False)
+            self._fw_cr_draft = _resolve_faster_whisper_compression_ratio(draft=True)
+            self._fw_cr_final = _resolve_faster_whisper_compression_ratio(draft=False)
+            self._fw_initial_prompt = _resolve_whisper_initial_prompt()
         elif hub_model_id:
             if not TRANSFORMERS_AVAILABLE:
                 st.error("Пакет transformers необходим для дообученной модели с Hub (режим PyTorch).")
@@ -807,6 +938,11 @@ class AudioTranscriberWithMetrics:
             self.model.eval()
             self._draft_beam_size = resolve_draft_beam_size()
             self._draft_vad_filter = resolve_draft_vad_filter()
+            self._fw_ns_draft = 0.6
+            self._fw_ns_final = 0.6
+            self._fw_cr_draft = 2.4
+            self._fw_cr_final = 2.4
+            self._fw_initial_prompt = _resolve_whisper_initial_prompt()
         else:
             if not silent_ui:
                 st.info(f"Загрузка базовой модели Whisper ({model_size})...")
@@ -815,18 +951,31 @@ class AudioTranscriberWithMetrics:
             self.use_faster_whisper = False
             self._draft_beam_size = 1
             self._draft_vad_filter = False
+            self._fw_ns_draft = 0.6
+            self._fw_ns_final = 0.6
+            self._fw_cr_draft = 2.4
+            self._fw_cr_final = 2.4
+            self._fw_initial_prompt = ""
 
     def transcribe_audio(self, audio_path, language="ru", *, draft: bool = False):
         """Транскрибация аудиофайла. draft=True — быстрые настройки для live-кусков (только faster-whisper)."""
         if getattr(self, "use_faster_whisper", False):
             beam = getattr(self, "_draft_beam_size", 1) if draft else 5
             vad = getattr(self, "_draft_vad_filter", True) if draft else False
-            segments, _info = self.faster_model.transcribe(
-                audio_path,
+            ns = getattr(self, "_fw_ns_draft" if draft else "_fw_ns_final", 0.62)
+            cr = getattr(self, "_fw_cr_draft" if draft else "_fw_cr_final", 2.35)
+            ip = (getattr(self, "_fw_initial_prompt", None) or "").strip()
+            kw = dict(
                 language=language,
                 beam_size=beam,
                 vad_filter=vad,
+                no_speech_threshold=ns,
+                compression_ratio_threshold=cr,
+                condition_on_previous_text=False if draft else True,
             )
+            if ip:
+                kw["initial_prompt"] = ip
+            segments, _info = self.faster_model.transcribe(audio_path, **kw)
             return "".join(seg.text for seg in segments).strip()
 
         if self.use_transformers:
@@ -956,6 +1105,7 @@ if "protocol_editor_text" not in st.session_state:
 
 
 def _sync_live_transcript_from_whisper() -> None:
+    ensure_webrtc_shared_initialized()
     if st.session_state.get("live_transcript_pause_auto_sync"):
         return
     lk = st.session_state.webrtc_shared.get("lock")
@@ -985,6 +1135,7 @@ webrtc_streamer(
 )
 
 if st.session_state.pop("_pending_webrtc_full_reset", False):
+    ensure_webrtc_shared_initialized()
     _rlk = st.session_state.webrtc_shared.get("lock")
     if _rlk:
         with _rlk:
@@ -996,6 +1147,7 @@ if st.session_state.pop("_pending_webrtc_full_reset", False):
     st.session_state.live_transcript_pause_auto_sync = False
 
 if st.session_state.pop("_pending_apply_live_whisper", False):
+    ensure_webrtc_shared_initialized()
     _alk = st.session_state.webrtc_shared.get("lock")
     _auto = ""
     if _alk:
@@ -1059,6 +1211,7 @@ with st.expander("Дополнительно: полный Whisper по нако
         "строит протокол по live-транскрипту и короткому догону хвоста."
     )
     if st.button("Запустить полный Whisper по буферу", key="full_buffer_whisper_once"):
+        ensure_webrtc_shared_initialized()
         _sh = st.session_state.webrtc_shared
         _lk = _sh.get("lock")
         _al = _sh.get("asr_lock")
@@ -1096,6 +1249,7 @@ with st.expander("Дополнительно: полный Whisper по нако
                         pass
 
 if st.button("Заполнить протокол по транскрипту", type="primary"):
+    ensure_webrtc_shared_initialized()
     if not yandex_llm_configured():
         st.error(
             "Не заданы параметры для заполнения протокола: укажите "
