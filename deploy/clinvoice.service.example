@@ -1,0 +1,24 @@
+# Пример systemd unit: /etc/systemd/system/clinvoice.service
+# Пользователь clinvoice должен иметь права на каталог приложения и CLINVOICE_CACHE_DIR.
+#
+# После правки:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now clinvoice
+
+[Unit]
+Description=ClinVoice Streamlit
+After=network.target
+
+[Service]
+Type=simple
+User=clinvoice
+Group=clinvoice
+WorkingDirectory=/opt/clinvoice
+Environment="PATH=/opt/clinvoice/.venv/bin:/usr/local/bin:/usr/bin"
+EnvironmentFile=-/etc/clinvoice.env
+ExecStart=/opt/clinvoice/.venv/bin/streamlit run app.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

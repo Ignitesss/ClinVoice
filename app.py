@@ -98,11 +98,27 @@ def apply_disk_cache_layout(cache_root: str) -> None:
 _APP_CACHE_ROOT = resolve_app_cache_root()
 apply_disk_cache_layout(_APP_CACHE_ROOT)
 
+
+def resolve_sqlite_path() -> str:
+    """Путь к SQLite: env CLINVOICE_SQLITE_PATH, секрет Streamlit, или cache/clinvoice.db."""
+    p = (os.environ.get("CLINVOICE_SQLITE_PATH") or "").strip()
+    if not p:
+        try:
+            if hasattr(st, "secrets") and st.secrets and "CLINVOICE_SQLITE_PATH" in st.secrets:
+                p = str(st.secrets["CLINVOICE_SQLITE_PATH"]).strip()
+        except Exception:
+            pass
+    if not p:
+        p = os.path.join(_APP_CACHE_ROOT, "clinvoice.db")
+    return p
+
+
 import base64
 import io
 import json
 import struct
 import tempfile
+import uuid
 import threading
 import wave
 import whisper
@@ -237,6 +253,8 @@ from protocol import (
 )
 from webrtc_draft import DraftAudioProcessor, advance_after_empty_transcript
 
+import clinvoice_db
+
 # For loading fine-tuned Whisper models
 try:
     from transformers import AutoConfig, WhisperForConditionalGeneration, WhisperProcessor
@@ -252,7 +270,7 @@ def resolve_live_whisper_interval_sec() -> float:
     """
     Период тика инкрементального live-Whisper (секунды).
     **CLINVOICE_LIVE_WHISPER_INTERVAL_SEC** (env или Streamlit Secrets).
-    По умолчанию 6; значение ограничивается диапазоном [3, 15] (чаще тик — меньше «пропусков» в UI).
+    По умолчанию 5; значение ограничивается диапазоном [3, 15] (чаще тик — меньше «пропусков» в UI).
     """
     raw = (os.environ.get("CLINVOICE_LIVE_WHISPER_INTERVAL_SEC") or "").strip()
     if not raw:
@@ -261,7 +279,7 @@ def resolve_live_whisper_interval_sec() -> float:
                 raw = str(st.secrets["CLINVOICE_LIVE_WHISPER_INTERVAL_SEC"]).strip()
         except Exception:
             pass
-    default = 6.0
+    default = 5.0
     if not raw:
         v = default
     else:
@@ -275,7 +293,7 @@ def resolve_live_whisper_interval_sec() -> float:
 def resolve_draft_tail_max_seconds() -> float:
     """
     Макс. длина одного PCM-среза для инкрементального live-черновика (сек).
-    **CLINVOICE_DRAFT_TAIL_MAX_SECONDS** — env или Secrets; по умолчанию 15; диапазон [5, 60].
+    **CLINVOICE_DRAFT_TAIL_MAX_SECONDS** — env или Secrets; по умолчанию 22; диапазон [5, 60].
     """
     raw = (os.environ.get("CLINVOICE_DRAFT_TAIL_MAX_SECONDS") or "").strip()
     if not raw:
@@ -284,7 +302,7 @@ def resolve_draft_tail_max_seconds() -> float:
                 raw = str(st.secrets["CLINVOICE_DRAFT_TAIL_MAX_SECONDS"]).strip()
         except Exception:
             pass
-    default = 15.0
+    default = 22.0
     if not raw:
         v = default
     else:
@@ -1164,6 +1182,105 @@ def build_structured_protocol_txt(fields: dict, consultation_date: str) -> str:
     return "\n".join(parts)
 
 
+def _query_param_first(key: str) -> Optional[str]:
+    try:
+        qp = st.query_params
+        if key not in qp:
+            return None
+        v = qp[key]
+        if isinstance(v, list):
+            return str(v[0]) if v else None
+        return str(v)
+    except Exception:
+        return None
+
+
+def _valid_uuid_string(s: str) -> bool:
+    try:
+        uuid.UUID(str(s))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _collect_snapshot_payload() -> dict:
+    ot = st.session_state.get("original_transcription")
+    return {
+        "live_transcript_editor": st.session_state.get("live_transcript_editor") or "",
+        "live_transcript_pause_auto_sync": bool(
+            st.session_state.get("live_transcript_pause_auto_sync", False)
+        ),
+        "original_transcription": ot,
+        "doctor_transcript_editor": st.session_state.get("doctor_transcript_editor") or "",
+        "protocol_editor_text": st.session_state.get("protocol_editor_text") or "",
+        "protocol_consultation_date": st.session_state.get("protocol_consultation_date") or "",
+        "status": "draft",
+    }
+
+
+def _apply_db_snapshot(payload: dict) -> None:
+    if not payload:
+        return
+    if "live_transcript_editor" in payload:
+        st.session_state.live_transcript_editor = payload.get("live_transcript_editor") or ""
+    if "live_transcript_pause_auto_sync" in payload:
+        st.session_state.live_transcript_pause_auto_sync = bool(
+            payload.get("live_transcript_pause_auto_sync")
+        )
+    if "original_transcription" in payload:
+        st.session_state.original_transcription = payload.get("original_transcription")
+    if "doctor_transcript_editor" in payload:
+        st.session_state.doctor_transcript_editor = payload.get("doctor_transcript_editor") or ""
+    if "protocol_editor_text" in payload:
+        st.session_state.protocol_editor_text = payload.get("protocol_editor_text") or ""
+    if "protocol_consultation_date" in payload:
+        st.session_state.protocol_consultation_date = payload.get("protocol_consultation_date") or ""
+
+
+def bootstrap_consultation(db_path: str) -> None:
+    if st.session_state.get("_consultation_bootstrapped"):
+        return
+    clinvoice_db.init_db(db_path)
+    if "_sqlite_purge_done" not in st.session_state:
+        clinvoice_db.purge_expired(db_path)
+        st.session_state._sqlite_purge_done = True
+
+    qp_cid = _query_param_first("consultation_id")
+    loaded = False
+
+    if qp_cid and _valid_uuid_string(qp_cid):
+        if clinvoice_db.consultation_exists(db_path, qp_cid):
+            st.session_state.consultation_id = qp_cid
+            snap = clinvoice_db.load_latest_snapshot(db_path, qp_cid)
+            if snap:
+                _apply_db_snapshot(snap)
+            clinvoice_db.upsert_consultation_row(db_path, qp_cid)
+            loaded = True
+        else:
+            st.warning(
+                "Консультация с этим идентификатором не найдена в локальной базе. Создана новая."
+            )
+
+    if not loaded:
+        if "consultation_id" not in st.session_state:
+            st.session_state.consultation_id = str(uuid.uuid4())
+        clinvoice_db.upsert_consultation_row(db_path, st.session_state.consultation_id)
+
+    try:
+        st.query_params["consultation_id"] = st.session_state.consultation_id
+    except Exception:
+        pass
+
+    st.session_state._consultation_bootstrapped = True
+
+
+def persist_snapshot(db_path: str) -> None:
+    cid = st.session_state.get("consultation_id")
+    if not cid:
+        return
+    clinvoice_db.save_draft_snapshot(db_path, cid, _collect_snapshot_payload())
+
+
 # ============ MAIN UI ============
 
 st.title("🏥 ClinVoice")
@@ -1181,6 +1298,50 @@ if "original_transcription" not in st.session_state:
     st.session_state.original_transcription = None
 if "protocol_editor_text" not in st.session_state:
     st.session_state.protocol_editor_text = ""
+
+_SQLITE_PATH = resolve_sqlite_path()
+bootstrap_consultation(_SQLITE_PATH)
+
+with st.expander("Сохранение и восстановление консультации", expanded=False):
+    st.caption(
+        "Черновик сохраняется в SQLite на сервере (TTL по `CLINVOICE_DB_TTL_HOURS`, по умолчанию 48 ч). "
+        "Откройте ту же страницу с параметром **consultation_id** в адресе — или используйте ссылку ниже."
+    )
+    _cid = st.session_state.get("consultation_id") or ""
+    st.markdown("**Идентификатор консультации:**")
+    st.code(_cid or "—", language=None)
+    st.caption(
+        "Откройте приложение с параметром в URL: `?consultation_id=<uuid>` — адрес можно сохранить в закладках."
+    )
+
+    col_save, col_new = st.columns(2)
+    with col_save:
+        if st.button("Сохранить черновик сейчас", key="persist_manual_save"):
+            try:
+                persist_snapshot(_SQLITE_PATH)
+                st.success("Черновик записан в базу.")
+            except Exception as ex:
+                st.error(str(ex))
+    with col_new:
+        if st.button("Новая консультация", key="persist_new_consultation"):
+            nid = str(uuid.uuid4())
+            st.session_state.consultation_id = nid
+            try:
+                st.query_params["consultation_id"] = nid
+            except Exception:
+                pass
+            st.session_state.original_transcription = None
+            st.session_state.protocol_editor_text = ""
+            st.session_state.live_transcript_editor = ""
+            st.session_state.live_transcript_pause_auto_sync = False
+            st.session_state.pop("doctor_transcript_editor", None)
+            st.session_state.pop("protocol_consultation_date", None)
+            try:
+                clinvoice_db.upsert_consultation_row(_SQLITE_PATH, nid)
+            except Exception as ex:
+                st.error(str(ex))
+            st.session_state._pending_webrtc_full_reset = True
+            st.rerun()
 
 
 def _sync_live_transcript_from_whisper() -> None:
@@ -1382,6 +1543,10 @@ if st.button("Заполнить протокол по транскрипту", 
             "Текст протокола должен сохраниться автоматически как **протокол.txt**; "
             "если загрузка не началась, скачайте файл кнопкой в блоке протокола."
         )
+        try:
+            persist_snapshot(_SQLITE_PATH)
+        except Exception:
+            pass
         _auto_txt = build_structured_protocol_txt(protocol, st.session_state.protocol_consultation_date)
         trigger_browser_text_download("протокол.txt", _auto_txt)
         if lk:
@@ -1449,6 +1614,16 @@ if st.session_state.original_transcription:
         "text/plain",
     )
 
+@st.fragment(run_every=timedelta(seconds=45))
+def _autosave_sqlite_fragment() -> None:
+    try:
+        persist_snapshot(_SQLITE_PATH)
+    except Exception:
+        pass
+
+
+_autosave_sqlite_fragment()
+
 # Footer
 st.markdown("---")
-st.markdown("*ClinVoice v0.4 — распознавание речи для консультаций*")
+st.markdown("*ClinVoice v0.5 — распознавание речи для консультаций*")
