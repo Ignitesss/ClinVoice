@@ -508,6 +508,35 @@ def _ice_server_key(entry: dict) -> str:
     return str(u)
 
 
+def _sanitize_ice_servers_for_frontend(servers: List[dict]) -> List[dict]:
+    """
+    Только поля, ожидаемые RTCIceServer в браузере + JSON-safe значения.
+    Лишние ключи из Twilio/HF могут ломать фронтенд компонента.
+    """
+    out: List[dict] = []
+    for raw in servers:
+        if not isinstance(raw, dict) or "urls" not in raw:
+            continue
+        urls = raw.get("urls")
+        if urls is None:
+            continue
+        if isinstance(urls, list):
+            urls_clean = [str(u).strip() for u in urls if u]
+            if not urls_clean:
+                continue
+            entry: dict = {"urls": urls_clean if len(urls_clean) > 1 else urls_clean[0]}
+        else:
+            entry = {"urls": str(urls).strip()}
+        u = raw.get("username")
+        if u is not None and str(u).strip():
+            entry["username"] = str(u).strip()
+        c = raw.get("credential")
+        if c is not None and str(c).strip():
+            entry["credential"] = str(c).strip()
+        out.append(entry)
+    return out
+
+
 def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
     """
     ICE для браузера и для aiortc на сервере: сначала встроенный набор streamlit-webrtc
@@ -566,6 +595,11 @@ def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
         except json.JSONDecodeError:
             pass
 
+    if not merged:
+        merged = [{"urls": "stun:stun.l.google.com:19302"}]
+
+    merged = _sanitize_ice_servers_for_frontend(merged)
+    merged.sort(key=_ice_server_key)
     if not merged:
         merged = [{"urls": "stun:stun.l.google.com:19302"}]
 
@@ -1267,7 +1301,10 @@ def bootstrap_consultation(db_path: str) -> None:
         clinvoice_db.upsert_consultation_row(db_path, st.session_state.consultation_id)
 
     try:
-        st.query_params["consultation_id"] = st.session_state.consultation_id
+        _cid_out = str(st.session_state.consultation_id)
+        _cur_qp = _query_param_first("consultation_id")
+        if _cur_qp != _cid_out:
+            st.query_params["consultation_id"] = _cid_out
     except Exception:
         pass
 
@@ -1301,47 +1338,6 @@ if "protocol_editor_text" not in st.session_state:
 
 _SQLITE_PATH = resolve_sqlite_path()
 bootstrap_consultation(_SQLITE_PATH)
-
-with st.expander("Сохранение и восстановление консультации", expanded=False):
-    st.caption(
-        "Черновик сохраняется в SQLite на сервере (TTL по `CLINVOICE_DB_TTL_HOURS`, по умолчанию 48 ч). "
-        "Откройте ту же страницу с параметром **consultation_id** в адресе — или используйте ссылку ниже."
-    )
-    _cid = st.session_state.get("consultation_id") or ""
-    st.markdown("**Идентификатор консультации:**")
-    st.code(_cid or "—", language=None)
-    st.caption(
-        "Откройте приложение с параметром в URL: `?consultation_id=<uuid>` — адрес можно сохранить в закладках."
-    )
-
-    col_save, col_new = st.columns(2)
-    with col_save:
-        if st.button("Сохранить черновик сейчас", key="persist_manual_save"):
-            try:
-                persist_snapshot(_SQLITE_PATH)
-                st.success("Черновик записан в базу.")
-            except Exception as ex:
-                st.error(str(ex))
-    with col_new:
-        if st.button("Новая консультация", key="persist_new_consultation"):
-            nid = str(uuid.uuid4())
-            st.session_state.consultation_id = nid
-            try:
-                st.query_params["consultation_id"] = nid
-            except Exception:
-                pass
-            st.session_state.original_transcription = None
-            st.session_state.protocol_editor_text = ""
-            st.session_state.live_transcript_editor = ""
-            st.session_state.live_transcript_pause_auto_sync = False
-            st.session_state.pop("doctor_transcript_editor", None)
-            st.session_state.pop("protocol_consultation_date", None)
-            try:
-                clinvoice_db.upsert_consultation_row(_SQLITE_PATH, nid)
-            except Exception as ex:
-                st.error(str(ex))
-            st.session_state._pending_webrtc_full_reset = True
-            st.rerun()
 
 
 def _sync_live_transcript_from_whisper() -> None:
@@ -1395,6 +1391,48 @@ if st.session_state.pop("_pending_apply_live_whisper", False):
             _auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
     st.session_state.live_transcript_editor = _auto
     st.session_state.live_transcript_pause_auto_sync = False
+
+
+with st.expander("Сохранение и восстановление консультации", expanded=False):
+    st.caption(
+        "Черновик сохраняется в SQLite на сервере (TTL по `CLINVOICE_DB_TTL_HOURS`, по умолчанию 48 ч). "
+        "Откройте ту же страницу с параметром **consultation_id** в адресе — или используйте ссылку ниже."
+    )
+    _cid = st.session_state.get("consultation_id") or ""
+    st.markdown("**Идентификатор консультации:**")
+    st.code(_cid or "—", language=None)
+    st.caption(
+        "Откройте приложение с параметром в URL: `?consultation_id=<uuid>` — адрес можно сохранить в закладках."
+    )
+
+    col_save, col_new = st.columns(2)
+    with col_save:
+        if st.button("Сохранить черновик сейчас", key="persist_manual_save"):
+            try:
+                persist_snapshot(_SQLITE_PATH)
+                st.success("Черновик записан в базу.")
+            except Exception as ex:
+                st.error(str(ex))
+    with col_new:
+        if st.button("Новая консультация", key="persist_new_consultation"):
+            nid = str(uuid.uuid4())
+            st.session_state.consultation_id = nid
+            try:
+                st.query_params["consultation_id"] = nid
+            except Exception:
+                pass
+            st.session_state.original_transcription = None
+            st.session_state.protocol_editor_text = ""
+            st.session_state.live_transcript_editor = ""
+            st.session_state.live_transcript_pause_auto_sync = False
+            st.session_state.pop("doctor_transcript_editor", None)
+            st.session_state.pop("protocol_consultation_date", None)
+            try:
+                clinvoice_db.upsert_consultation_row(_SQLITE_PATH, nid)
+            except Exception as ex:
+                st.error(str(ex))
+            st.session_state._pending_webrtc_full_reset = True
+            st.rerun()
 
 
 @st.fragment(run_every=timedelta(milliseconds=400))
