@@ -10,8 +10,6 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Либо просто перейдите по ссылке, чтобы попробовать наш сервис - https://clinvoice-d6qrtxccwn8gy5zuxvnbx5.streamlit.app/
-
 ## Требования к системе
 
 - Python **3.10–3.12** (рекомендуется **3.12**)
