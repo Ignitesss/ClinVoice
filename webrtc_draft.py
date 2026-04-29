@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import os
 import wave
-from typing import List, object
+from typing import Any, List
 
 import av
 
@@ -23,8 +23,8 @@ def _max_pcm_bytes() -> int:
 
 
 def audio_frames_to_pcm_mono_s16le_16k(
-    frames: List[object],
-    resampler: object,
+    frames: List[Any],
+    resampler: Any,
 ) -> bytes:
     """PyAV AudioFrame → LINEAR16 mono 16 kHz; ``resampler`` — один AudioResampler на сеанс."""
     out_chunks: List[bytes] = []
