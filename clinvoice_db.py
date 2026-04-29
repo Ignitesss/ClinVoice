@@ -66,10 +66,20 @@ def _migrate_consultations_add_user_id(conn: sqlite3.Connection) -> None:
 
 
 def init_db(path: str) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with _connect(path) as conn:
+    try:
+        conn_ctx = _connect(path)
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e).lower():
+            raise sqlite3.OperationalError(
+                f"{e}; path={abs_path!r} (проверьте CLINVOICE_SQLITE_PATH, "
+                f"CLINVOICE_CACHE_DIR и права на запись в каталог)"
+            ) from e
+        raise
+    with conn_ctx as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (

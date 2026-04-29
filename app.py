@@ -609,6 +609,8 @@ def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
     if raw:
         try:
             extra = json.loads(raw)
+            if isinstance(extra, dict) and isinstance(extra.get("iceServers"), list):
+                extra = extra["iceServers"]
             if isinstance(extra, list):
                 for item in extra:
                     if isinstance(item, dict):
@@ -1384,13 +1386,6 @@ st.caption(
     "Чтобы сбросить поля приложения и буфер записи, используйте Clear session state "
     "(или кнопку «Сбросить запись…» на странице)."
 )
-st.caption(
-    "**Микрофон:** браузер отдаёт доступ только по **HTTPS** или с адреса **localhost** / **127.0.0.1**. "
-    "Если вы открыли приложение как `http://IP:порт` или `http://имя-хоста` по сети без TLS, при «Начать запись» "
-    "будет ошибка про `navigator.mediaDevices` и небезопасную страницу. "
-    "Откройте страницу на том же компьютере через `http://127.0.0.1:8501`, настройте HTTPS для сервера "
-    "или используйте SSH-туннель (`ssh -L 8501:127.0.0.1:8501 user@сервер`)."
-)
 if "original_transcription" not in st.session_state:
     st.session_state.original_transcription = None
 if "protocol_editor_text" not in st.session_state:
@@ -1454,7 +1449,6 @@ if st.session_state.pop("_pending_apply_live_whisper", False):
 
 with st.expander("Сохранение и восстановление консультации", expanded=False):
     st.caption(
-        "Черновик сохраняется в SQLite на сервере (TTL по `CLINVOICE_DB_TTL_HOURS`, по умолчанию 48 ч). "
         "Откройте ту же страницу с параметром **consultation_id** в адресе — или используйте ссылку ниже."
     )
     _cid = st.session_state.get("consultation_id") or ""
