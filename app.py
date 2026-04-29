@@ -126,7 +126,7 @@ import whisper
 from docx import Document
 import torch
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
@@ -878,6 +878,46 @@ def transcribe_wav_in_chunks(
     return " ".join(p.strip() for p in parts if p.strip()).strip()
 
 
+def _persist_uploaded_audio_to_temp(upload: Any) -> str:
+    """Байты из ``st.file_uploader`` → временный файл (расширение из имени для librosa)."""
+    name = (getattr(upload, "name", None) or "upload").strip()
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in (".wav", ".wave", ".mp3", ".webm", ".ogg", ".flac", ".m4a", ".aac"):
+        ext = ".wav"
+    fd, path = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    with open(path, "wb") as wf:
+        wf.write(upload.getvalue())
+    return path
+
+
+def normalize_media_path_to_temp_wav16_mono(src_path: str) -> str:
+    """Файл в любом формате, который читает librosa → моно 16 kHz PCM WAV (новый временный путь)."""
+    import librosa
+    import numpy as np
+
+    y, _sr = librosa.load(src_path, sr=16000, mono=True)
+    y = np.clip(np.asarray(y, dtype=np.float32), -1.0, 1.0)
+    pcm = (y * 32767.0).astype(np.int16).tobytes()
+    fd, out_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with open(out_path, "wb") as wf:
+        wf.write(pcm_mono_s16le_to_wav_bytes(pcm, 16000))
+    return out_path
+
+
+def apply_file_transcription_to_live_editor(text: str, append: bool) -> None:
+    """Записать распознанный текст в поле транскрипта (замена или дописывание)."""
+    t = (text or "").strip()
+    if not t:
+        return
+    cur = (st.session_state.get("live_transcript_editor") or "").strip()
+    if append and cur:
+        st.session_state.live_transcript_editor = cur + "\n\n" + t
+    else:
+        st.session_state.live_transcript_editor = t
+
+
 def resolve_hub_model_id() -> str:
     env_id = (os.environ.get("CLINVOICE_HF_MODEL_REPO") or "").strip()
     if env_id:
@@ -1445,6 +1485,101 @@ if st.session_state.pop("_pending_apply_live_whisper", False):
             _auto = st.session_state.webrtc_shared.get("live_whisper_text") or ""
     st.session_state.live_transcript_editor = _auto
     st.session_state.live_transcript_pause_auto_sync = False
+
+
+with st.expander("Запись без WebRTC: файл или микрофон в браузере", expanded=False):
+    st.caption(
+        "Если WebRTC не подключается: загрузите аудио (WAV, MP3, …) или запишите в браузере, "
+        "нажмите «Распознать» — текст попадёт в поле транскрипта ниже; протокол строится как обычно. "
+        "Для MP3/M4A на сервере может понадобиться **ffmpeg**."
+    )
+    _append_choice = st.radio(
+        "Куда поместить распознанный текст",
+        options=["Заменить поле транскрипта", "Добавить в конец поля"],
+        horizontal=True,
+        key="clinvoice_file_asr_append_mode",
+    )
+    _append = _append_choice.startswith("Добавить")
+
+    _up_audio = st.file_uploader(
+        "Загрузить аудиофайл",
+        type=["wav", "wave", "mp3", "webm", "ogg", "flac", "m4a", "aac"],
+        key="clinvoice_upload_audio",
+    )
+
+    _rec_segment = None
+    try:
+        from audiorecorder import audiorecorder
+
+        st.caption("Запись в браузере; на сервер файл уходит только после «Распознать запись».")
+        _rec_segment = audiorecorder(
+            start_prompt="Начать запись",
+            stop_prompt="Остановить запись",
+            pause_prompt="",
+            key="clinvoice_audiorecorder",
+        )
+        if _rec_segment is not None:
+            _prev = io.BytesIO()
+            _rec_segment.export(_prev, format="wav")
+            _prev.seek(0)
+            st.audio(_prev.getvalue(), format="audio/wav")
+    except ImportError:
+        st.info(
+            "Запись в браузере: установите пакет **streamlit-audiorecorder** "
+            "(`pip install streamlit-audiorecorder`)."
+        )
+
+    _col_u, _col_r = st.columns(2)
+    with _col_u:
+        _go_upload = st.button(
+            "Распознать файл",
+            key="clinvoice_transcribe_upload",
+            disabled=_up_audio is None,
+        )
+    with _col_r:
+        _go_rec = st.button(
+            "Распознать запись",
+            key="clinvoice_transcribe_audiorec",
+            disabled=_rec_segment is None,
+        )
+
+    if _go_upload or _go_rec:
+        _src_tmp: Optional[str] = None
+        _wav_tmp: Optional[str] = None
+        try:
+            if _go_upload and _up_audio is not None:
+                _src_tmp = _persist_uploaded_audio_to_temp(_up_audio)
+            elif _go_rec and _rec_segment is not None:
+                _bio = io.BytesIO()
+                _rec_segment.export(_bio, format="wav")
+                _bio.seek(0)
+                _fd, _src_tmp = tempfile.mkstemp(suffix=".wav")
+                os.close(_fd)
+                with open(_src_tmp, "wb") as _wf:
+                    _wf.write(_bio.getvalue())
+
+            if not _src_tmp:
+                st.warning("Нет источника аудио.")
+            else:
+                with st.spinner("Конвертация и распознавание…"):
+                    _wav_tmp = normalize_media_path_to_temp_wav16_mono(_src_tmp)
+                    _file_txt = transcribe_wav_in_chunks(
+                        _asr_transcriber, _wav_tmp, language="ru", draft=False
+                    )
+                if not (_file_txt or "").strip():
+                    st.warning("Распознавание вернуло пустой текст — проверьте громкость и формат.")
+                else:
+                    apply_file_transcription_to_live_editor(_file_txt, _append)
+                    st.success("Текст перенесён в поле «Транскрипт» ниже.")
+        except Exception as _ex:
+            st.error(str(_ex))
+        finally:
+            for _p in (_src_tmp, _wav_tmp):
+                if _p and os.path.isfile(_p):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        pass
 
 
 with st.expander("Сохранение и восстановление консультации", expanded=False):
