@@ -1,11 +1,9 @@
-# Пример для Linux: скопируйте в /etc/nginx/sites-available/ и подключите sites-enabled.
+# Пример для Linux: положите один раз в conf.d/ или sites-enabled/ (не дублируйте файл).
 # Предполагается сборка фронта: `cd frontend && npm run build` → статика из frontend/dist.
 # TLS может терминировать Cloudflare; локально можно слушать 8080 по HTTP.
-
-upstream clinvoice_api {
-    server 127.0.0.1:8000;
-    keepalive 32;
-}
+#
+# Прокси идёт напрямую на uvicorn (127.0.0.1:8000), без upstream — так не будет
+# ошибки «duplicate upstream», если в другом .conf уже объявлен свой upstream.
 
 server {
     listen 8080;
@@ -17,7 +15,7 @@ server {
     client_max_body_size 32m;
 
     location /api/ {
-        proxy_pass http://clinvoice_api;
+        proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -28,7 +26,7 @@ server {
     }
 
     location /ws/ {
-        proxy_pass http://clinvoice_api;
+        proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";

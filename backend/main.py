@@ -14,14 +14,14 @@ import clinvoice_db
 from backend.routers import audio_ws, auth as auth_router
 from backend.routers import consultations
 from backend.settings import get_settings
-from clinvoice_cache import apply_disk_cache_layout
+from clinvoice_cache import apply_disk_cache_layout, resolve_app_cache_root
 
 log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    apply_disk_cache_layout()
+    apply_disk_cache_layout(resolve_app_cache_root())
     db_path = auth.resolve_sqlite_path_cli()
     clinvoice_db.init_db(db_path)
     try:
