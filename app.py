@@ -563,7 +563,7 @@ def _sanitize_ice_servers_for_frontend(servers: List[dict]) -> List[dict]:
 def resolve_webrtc_rtc_configuration() -> RTCConfiguration:
     """
     ICE для браузера и для aiortc на сервере: сначала встроенный набор streamlit-webrtc
-    (Twilio / Hugging Face TURN при заданных TWILIO_* или HF_TOKEN), затем дополнительные STUN,
+    (Twilio TURN при TWILIO_*; **не задавайте HF_TOKEN** в процессе Streamlit, если не нужен TURN от Hugging Face — для загрузок с Hub используйте **HUGGING_FACE_HUB_TOKEN**),
     затем JSON из CLINVOICE_WEBRTC_ICE_SERVERS_JSON (env или Streamlit Secrets).
     """
     from streamlit_webrtc.credentials import get_available_ice_servers
