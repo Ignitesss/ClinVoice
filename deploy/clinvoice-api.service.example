@@ -1,0 +1,18 @@
+[Unit]
+Description=ClinVoice FastAPI (uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/clinvoice
+Environment=PYTHONUNBUFFERED=1
+# Секреты и ключи только через EnvironmentFile, не коммитьте реальный файл.
+EnvironmentFile=/etc/clinvoice.env
+ExecStart=/opt/clinvoice/.venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

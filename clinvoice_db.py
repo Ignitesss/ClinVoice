@@ -19,15 +19,6 @@ def resolve_ttl_hours() -> int:
     raw = (os.environ.get("CLINVOICE_DB_TTL_HOURS") or "").strip()
     if raw.isdigit():
         return max(1, min(8760, int(raw)))
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets") and st.secrets and "CLINVOICE_DB_TTL_HOURS" in st.secrets:
-            v = str(st.secrets["CLINVOICE_DB_TTL_HOURS"]).strip()
-            if v.isdigit():
-                return max(1, min(8760, int(v)))
-    except Exception:
-        pass
     return DEFAULT_TTL_HOURS
 
 
@@ -183,6 +174,14 @@ def get_user_by_username(path: str, username: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
+def get_user_by_id(path: str, user_id: int) -> Optional[sqlite3.Row]:
+    with _connect(path) as conn:
+        return conn.execute(
+            "SELECT id, username FROM users WHERE id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+
+
 def consultation_exists(path: str, cid: str, user_id: int) -> bool:
     if not cid:
         return False
@@ -192,6 +191,21 @@ def consultation_exists(path: str, cid: str, user_id: int) -> bool:
             (cid, user_id),
         ).fetchone()
         return r is not None
+
+
+def get_consultation(path: str, cid: str, user_id: int) -> Optional[sqlite3.Row]:
+    if not cid:
+        return None
+    with _connect(path) as conn:
+        return conn.execute(
+            """
+            SELECT id, user_id, created_at, updated_at, status
+            FROM consultations
+            WHERE id = ? AND user_id = ?
+            LIMIT 1
+            """,
+            (cid, user_id),
+        ).fetchone()
 
 
 def upsert_consultation_row(path: str, cid: str, user_id: int, status: str = "draft") -> None:

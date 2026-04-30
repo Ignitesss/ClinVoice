@@ -63,19 +63,11 @@ JSON_INSTRUCTION = """
 
 
 def resolve_yandex_api_key() -> Optional[str]:
+    """Только переменные окружения (FastAPI / CLI). Для локальных секретов используйте .env на сервере."""
     for name in ("YANDEX_CLOUD_API_KEY", "YC_API_KEY", "YANDEX_API_KEY"):
         k = (os.environ.get(name) or "").strip()
         if k:
             return k
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets"):
-            for key in ("YANDEX_CLOUD_API_KEY", "YC_API_KEY", "YANDEX_API_KEY"):
-                if key in st.secrets:
-                    return str(st.secrets[key]).strip()
-    except Exception:
-        pass
     return None
 
 
@@ -83,15 +75,6 @@ def resolve_yandex_iam_token() -> Optional[str]:
     t = (os.environ.get("YANDEX_IAM_TOKEN") or os.environ.get("YC_IAM_TOKEN") or "").strip()
     if t:
         return t
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets"):
-            for key in ("YANDEX_IAM_TOKEN", "YC_IAM_TOKEN"):
-                if key in st.secrets:
-                    return str(st.secrets[key]).strip()
-    except Exception:
-        pass
     return None
 
 
@@ -100,15 +83,6 @@ def resolve_yandex_folder_id() -> Optional[str]:
         k = (os.environ.get(name) or "").strip()
         if k:
             return k
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets"):
-            for key in ("YANDEX_FOLDER_ID", "YC_FOLDER_ID"):
-                if key in st.secrets:
-                    return str(st.secrets[key]).strip()
-    except Exception:
-        pass
     return None
 
 
@@ -116,24 +90,10 @@ def resolve_yandex_model_uri() -> Optional[str]:
     explicit = (os.environ.get("YANDEX_MODEL_URI") or "").strip()
     if explicit:
         return explicit
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets") and "YANDEX_MODEL_URI" in st.secrets:
-            return str(st.secrets["YANDEX_MODEL_URI"]).strip()
-    except Exception:
-        pass
     folder = resolve_yandex_folder_id()
     if not folder:
         return None
     variant = (os.environ.get("YANDEX_GPT_VARIANT") or "yandexgpt/latest").strip()
-    try:
-        import streamlit as st
-
-        if hasattr(st, "secrets") and "YANDEX_GPT_VARIANT" in st.secrets:
-            variant = str(st.secrets["YANDEX_GPT_VARIANT"]).strip() or variant
-    except Exception:
-        pass
     return f"gpt://{folder}/{variant}"
 
 

@@ -1,0 +1,42 @@
+# Пример systemd-юнита для ClinVoice (Streamlit только на localhost).
+#
+# 1. Замените пути и пользователя на свои:
+#    User=           — пользователь Linux на ВМ (не root)
+#    WorkingDirectory= — каталог с клоном репозитория (где лежит app.py)
+#    ExecStart=      — полный путь к streamlit из venv
+#
+# 2. Установка:
+#    sudo cp deploy/clinvoice-streamlit.service.example /etc/systemd/system/clinvoice-streamlit.service
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable --now clinvoice-streamlit
+#    sudo systemctl status clinvoice-streamlit
+#
+# 3. Секреты/окружение (Yandex, путь к БД и т.д.):
+#    создайте /etc/clinvoice.env (chmod 600) и раскомментируйте EnvironmentFile ниже;
+#    либо задайте переменные в [Service] через Environment=.
+#
+# 4. Логи: journalctl -u clinvoice-streamlit -f
+
+[Unit]
+Description=ClinVoice (Streamlit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clinvoice
+Group=clinvoice
+WorkingDirectory=/home/clinvoice/workspace_clinvoice
+
+# EnvironmentFile=-/etc/clinvoice.env
+
+ExecStart=/home/clinvoice/workspace_clinvoice/.venv/bin/streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+
+Restart=on-failure
+RestartSec=5
+
+# Ограничения по желанию:
+# NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
