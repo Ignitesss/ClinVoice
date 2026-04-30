@@ -95,7 +95,7 @@ async function submit() {
           </svg>
         </button>
       </div>
-      <p v-if="error" class="err">{{ error }}</p>
+      <p v-if="error" class="err err-msg">{{ error }}</p>
       <button type="submit" :disabled="busy">{{ busy ? '…' : 'Войти' }}</button>
     </form>
   </div>
@@ -143,13 +143,7 @@ label {
 .card > button[type='submit'] {
   margin-top: 0.35rem;
 }
-.err {
-  color: #b91c1c;
+.err-msg {
   margin: 0;
-}
-@media (prefers-color-scheme: dark) {
-  .err {
-    color: #fca5a5;
-  }
 }
 </style>

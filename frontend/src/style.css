@@ -2,6 +2,39 @@
 
 :root {
   --clinvoice-radius: 12px;
+
+  /* ClinVoice: бежево-зелёная тема, тёмный текст (не зависит от «тёмной» ОС) */
+  --text: #3d3a34;
+  --text-h: #141210;
+  --bg: #f4eedf;
+  --border: #cfc4b2;
+  --code-bg: #e8e0d0;
+  --accent: #2f6f4e;
+  --accent-bg: rgba(47, 111, 78, 0.14);
+  --accent-border: rgba(47, 111, 78, 0.42);
+  --social-bg: rgba(232, 224, 208, 0.85);
+  --shadow:
+    rgba(28, 27, 24, 0.07) 0 10px 15px -3px,
+    rgba(28, 27, 24, 0.04) 0 4px 6px -2px;
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #2a2824;
+    --text-h: #0f0e0c;
+    --bg: #e8e2d4;
+    --border: #c4b9a6;
+    --code-bg: #ded5c4;
+    --accent: #27624a;
+    --accent-bg: rgba(39, 98, 74, 0.18);
+    --accent-border: rgba(39, 98, 74, 0.48);
+    --social-bg: rgba(216, 208, 192, 0.65);
+    --shadow:
+      rgba(18, 16, 14, 0.1) 0 10px 15px -3px,
+      rgba(18, 16, 14, 0.05) 0 4px 6px -2px;
+  }
 }
 
 /* ClinVoice: оболочка приложения внутри #app (template-vanilla) */
@@ -123,36 +156,20 @@
 }
 
 .clinvoice-app .info {
-  color: #15803d;
+  color: #166534;
 }
 
 .clinvoice-app .err {
-  color: #b91c1c;
+  color: #991b1b;
 }
 
 .clinvoice-app button.danger {
   border-radius: var(--clinvoice-radius);
-  border-color: rgba(220, 38, 38, 0.45);
-  color: #dc2626;
-  background: rgba(220, 38, 38, 0.08);
+  border-color: rgba(153, 27, 27, 0.4);
+  color: #991b1b;
+  background: rgba(153, 27, 27, 0.08);
 }
 
 .clinvoice-app button.danger:hover:not(:disabled) {
-  border-color: #dc2626;
-}
-
-@media (prefers-color-scheme: dark) {
-  .clinvoice-app .info {
-    color: #86efac;
-  }
-
-  .clinvoice-app .err {
-    color: #fca5a5;
-  }
-
-  .clinvoice-app button.danger {
-    color: #fca5a5;
-    background: rgba(248, 113, 113, 0.12);
-    border-color: rgba(248, 113, 113, 0.45);
-  }
+  border-color: #991b1b;
 }
