@@ -74,7 +74,7 @@ async def audio_stream(websocket: WebSocket) -> None:
         await websocket.send_json(
             {
                 "type": "warn",
-                "message": "SpeechKit не настроен — накопление аудио без живого черновика",
+                "message": "Живой черновик недоступен (проверьте ключи облака); запись накапливается.",
             }
         )
 

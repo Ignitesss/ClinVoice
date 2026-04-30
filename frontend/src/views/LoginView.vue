@@ -55,44 +55,52 @@ async function submit() {
   max-width: 420px;
   margin: 3rem auto;
   padding: 1rem;
-  font-family: system-ui, sans-serif;
+  color: #000;
+  background: #fff;
 }
 h1 {
   margin: 0 0 0.25rem;
+  color: #000;
 }
 .muted {
-  color: #555;
+  color: #000;
   margin: 0 0 1.5rem;
 }
 .card {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  padding: 1rem;
+  border: 1px solid #000;
+  background: #fff;
 }
 label {
   font-size: 0.85rem;
   font-weight: 600;
+  color: #000;
 }
 input {
   padding: 0.5rem 0.6rem;
-  border: 1px solid #ccc;
-  border-radius: 6px;
+  border: 1px solid #000;
+  border-radius: 0;
+  background: #fff;
+  color: #000;
 }
 button {
   margin-top: 0.5rem;
   padding: 0.55rem 1rem;
-  border: none;
-  border-radius: 6px;
-  background: #1a5f7a;
-  color: #fff;
+  border: 1px solid #000;
+  border-radius: 0;
+  background: #fff;
+  color: #000;
   cursor: pointer;
 }
 button:disabled {
-  opacity: 0.6;
+  opacity: 0.45;
   cursor: default;
 }
 .err {
-  color: #a00;
+  color: #000;
   margin: 0;
 }
 </style>

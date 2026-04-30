@@ -9,8 +9,10 @@ const router = useRouter()
 const consultationId = ref('')
 const creatingConsultation = ref(false)
 const draft = ref('')
-const speechkitErr = ref('')
+const liveError = ref('')
 const statusMsg = ref('')
+/** цвет строки statusMsg: зелёный (ok) или красный (err) */
+const statusKind = ref<'ok' | 'err'>('ok')
 const busy = ref(false)
 const finalizing = ref(false)
 
@@ -28,6 +30,15 @@ let processor: ScriptProcessorNode | null = null
 let sourceNode: MediaStreamAudioSourceNode | null = null
 
 const OUT_SR = 16000
+
+function setStatus(msg: string, kind: 'ok' | 'err') {
+  statusKind.value = kind
+  statusMsg.value = msg
+}
+
+function clearStatus() {
+  statusMsg.value = ''
+}
 
 function floatToInt16Downsample(input: Float32Array, inRate: number, outRate: number): ArrayBuffer {
   if (inRate === outRate) {
@@ -61,19 +72,19 @@ function connectWs() {
       try {
         const msg = JSON.parse(ev.data) as { type: string; text?: string; message?: string }
         if (msg.type === 'draft' && msg.text !== undefined) draft.value = msg.text
-        if (msg.type === 'speechkit_error' && msg.message) speechkitErr.value = msg.message
-        if (msg.type === 'warn' && msg.message) statusMsg.value = msg.message
-        if (msg.type === 'error' && msg.message) speechkitErr.value = msg.message
+        if (msg.type === 'speechkit_error' && msg.message) liveError.value = msg.message
+        if (msg.type === 'warn' && msg.message) setStatus(msg.message, 'ok')
+        if (msg.type === 'error' && msg.message) liveError.value = msg.message
       } catch {
         /* ignore */
       }
     }
   }
   ws.onopen = () => {
-    speechkitErr.value = ''
+    liveError.value = ''
   }
   ws.onerror = () => {
-    speechkitErr.value = 'Ошибка WebSocket'
+    liveError.value = 'Ошибка WebSocket'
   }
 }
 
@@ -100,7 +111,7 @@ async function loadConsultation(id: string) {
 
 async function startMic() {
   if (recording.value) return
-  statusMsg.value = ''
+  clearStatus()
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
   audioCtx = new AudioContext()
   const inRate = audioCtx.sampleRate
@@ -142,9 +153,9 @@ async function saveSnapshot() {
       doctor_transcript_editor: transcriptView.value,
       live_transcript_editor: transcriptView.value,
     })
-    statusMsg.value = 'Черновик сохранён'
+    setStatus('Черновик сохранён', 'ok')
   } catch (e: unknown) {
-    statusMsg.value = e instanceof Error ? e.message : String(e)
+    setStatus(e instanceof Error ? e.message : String(e), 'err')
   } finally {
     busy.value = false
   }
@@ -156,9 +167,9 @@ async function resetBuf() {
   try {
     await api.resetAudio(consultationId.value)
     draft.value = ''
-    statusMsg.value = 'Буфер PCM сброшен'
+    setStatus('Буфер PCM сброшен', 'ok')
   } catch (e: unknown) {
-    statusMsg.value = e instanceof Error ? e.message : String(e)
+    setStatus(e instanceof Error ? e.message : String(e), 'err')
   } finally {
     busy.value = false
   }
@@ -167,15 +178,15 @@ async function resetBuf() {
 async function doFinalize() {
   if (!consultationId.value) return
   finalizing.value = true
-  speechkitErr.value = ''
+  liveError.value = ''
   try {
     const r = await api.finalizeConsultation(consultationId.value)
     transcriptView.value = r.transcription
     protocolText.value = r.protocol_editor_text
     originalDone.value = true
-    statusMsg.value = 'Готово: Whisper и протокол обновлены.'
+    setStatus('Готово: текст и протокол обновлены.', 'ok')
   } catch (e: unknown) {
-    statusMsg.value = e instanceof Error ? e.message : String(e)
+    setStatus(e instanceof Error ? e.message : String(e), 'err')
   } finally {
     finalizing.value = false
   }
@@ -233,9 +244,9 @@ watch(
     ws?.close()
     try {
       await loadConsultation(consultationId.value)
-      statusMsg.value = ''
+      clearStatus()
     } catch {
-      statusMsg.value = 'Не удалось загрузить консультацию'
+      setStatus('Не удалось загрузить консультацию', 'err')
     }
     connectWs()
   },
@@ -269,7 +280,7 @@ function togglePause() {
       <h2>Запись</h2>
       <label class="row">
         <input v-model="recordPaused" type="checkbox" @change="togglePause" />
-        Пауза (не накапливать и не слать в SpeechKit)
+        Пауза
       </label>
       <div class="row">
         <button v-if="!recording" type="button" @click="startMic">Начать запись с микрофона</button>
@@ -277,18 +288,18 @@ function togglePause() {
         <button type="button" :disabled="busy" @click="saveSnapshot">Сохранить черновик</button>
         <button type="button" :disabled="busy" @click="resetBuf">Сбросить буфер PCM</button>
       </div>
-      <p v-if="statusMsg" class="info">{{ statusMsg }}</p>
-      <p v-if="speechkitErr" class="err">{{ speechkitErr }}</p>
+      <p v-if="statusMsg" :class="statusKind === 'ok' ? 'info' : 'err'">{{ statusMsg }}</p>
+      <p v-if="liveError" class="err">{{ liveError }}</p>
     </section>
 
     <section class="card">
-      <h2>Черновик (SpeechKit)</h2>
+      <h2>Черновик</h2>
       <pre class="draft">{{ draft || '—' }}</pre>
     </section>
 
     <section class="card">
       <h2>Транскрипт</h2>
-      <p v-if="!originalDone" class="muted small">После «Заполнить протокол» здесь появится уточнённый Whisper текст.</p>
+      <p v-if="!originalDone" class="muted small">После «Заполнить протокол» здесь появится уточнённый текст.</p>
       <pre class="draft">{{ transcriptView || '—' }}</pre>
     </section>
 
@@ -297,7 +308,7 @@ function togglePause() {
       <textarea v-model="protocolText" rows="14" class="proto" placeholder="Дата:, Жалобы:, …" />
       <div class="row">
         <button type="button" :disabled="finalizing || !consultationId" @click="doFinalize">
-          {{ finalizing ? 'Обработка…' : 'Заполнить протокол (Whisper + YandexGPT)' }}
+          {{ finalizing ? 'Обработка…' : 'Заполнить протокол' }}
         </button>
         <button type="button" :disabled="!protocolText" @click="downloadText('протокол.txt', protocolText)">
           Скачать протокол .txt
@@ -313,46 +324,45 @@ function togglePause() {
   margin: 0 auto;
   padding: 1rem 1.25rem 3rem;
   font-family: system-ui, sans-serif;
+  color: #000;
+  background: #fff;
 }
 .head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #000;
 }
 h1 {
   margin: 0;
   font-size: 1.35rem;
+  color: #000;
 }
 .actions {
   display: flex;
   gap: 0.75rem;
 }
-.linkish {
-  background: none;
-  border: none;
-  color: #1a5f7a;
-  cursor: pointer;
-  text-decoration: underline;
-  padding: 0.25rem;
-}
 .muted {
-  color: #555;
+  color: #000;
 }
 .small {
   font-size: 0.85rem;
   word-break: break-all;
 }
 .card {
-  border: 1px solid #ddd;
-  border-radius: 8px;
+  border: 1px solid #000;
+  border-radius: 0;
   padding: 1rem 1.1rem;
   margin-top: 1rem;
-  background: #fafafa;
+  background: #fff;
 }
 h2 {
   margin: 0 0 0.75rem;
   font-size: 1.05rem;
+  color: #000;
 }
 .row {
   display: flex;
@@ -360,27 +370,49 @@ h2 {
   gap: 0.5rem;
   align-items: center;
   margin-top: 0.5rem;
+  color: #000;
+}
+.row input[type='checkbox'] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #000;
 }
 button {
   padding: 0.45rem 0.75rem;
-  border-radius: 6px;
-  border: 1px solid #ccc;
+  border-radius: 0;
+  border: 1px solid #000;
   background: #fff;
+  color: #000;
   cursor: pointer;
 }
+button.linkish {
+  border: none;
+  background: transparent;
+  color: #1a5f7a;
+  text-decoration: underline;
+  padding: 0.25rem 0.35rem;
+}
+button.linkish:hover {
+  color: #0d4a63;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 button.danger {
-  border-color: #c44;
-  color: #a22;
+  border-color: #000;
+  color: #000;
 }
 .draft {
   white-space: pre-wrap;
   margin: 0;
   padding: 0.75rem;
   background: #fff;
-  border: 1px solid #e0e0e0;
-  border-radius: 6px;
+  border: 1px solid #000;
+  border-radius: 0;
   min-height: 3rem;
   font-size: 0.9rem;
+  color: #000;
 }
 .proto {
   width: 100%;
@@ -388,18 +420,24 @@ button.danger {
   font-family: inherit;
   font-size: 0.9rem;
   padding: 0.5rem;
-  border-radius: 6px;
-  border: 1px solid #ccc;
+  border-radius: 0;
+  border: 1px solid #000;
+  background: #fff;
+  color: #000;
 }
 .info {
-  color: #0a5;
+  color: #15601d;
   margin: 0.5rem 0 0;
 }
 .err {
-  color: #a00;
+  color: #a40000;
   margin: 0.5rem 0 0;
 }
 code {
   font-size: 0.85rem;
+  padding: 0.15rem 0.35rem;
+  border: 1px solid #000;
+  background: #fff;
+  color: #000;
 }
 </style>
