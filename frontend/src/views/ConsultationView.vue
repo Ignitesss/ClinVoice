@@ -41,6 +41,68 @@ function clearStatus() {
   statusMsg.value = ''
 }
 
+/** 524/504: иногда нет e.response (обрыв), но в тексте есть код. */
+function finalizeErrorLooksLikeProxyTimeout(e: unknown): boolean {
+  if (isAxiosError(e)) {
+    const s = e.response?.status
+    if (s === 524 || s === 504) return true
+    const m = (e.message || '').toLowerCase()
+    if (m.includes('524') || m.includes('504')) return true
+  }
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase()
+  return /\b524\b|\b504\b/.test(msg)
+}
+
+/**
+ * После таймаута прокси сервер может ещё секунды обрабатывать finalize — первая GET сразу часто пустая.
+ * Несколько попыток с паузой вместо одной мгновенной загрузки.
+ */
+async function recoverSnapshotFromServer(id: string): Promise<boolean> {
+  const firstDelayMs = 2500
+  const stepMs = 3500
+  const maxSteps = 14
+  await new Promise<void>((r) => setTimeout(r, firstDelayMs))
+  for (let step = 0; step < maxSteps; step++) {
+    if (step > 0) {
+      await new Promise<void>((r) => setTimeout(r, stepMs))
+    }
+    setStatus(
+      `Прокси оборвал ответ, но сервер мог доработать — подгружаем черновик (попытка ${step + 1}/${maxSteps})…`,
+      'ok',
+    )
+    try {
+      await loadConsultation(id)
+    } catch {
+      continue
+    }
+    if (transcriptView.value.trim() || protocolText.value.trim()) {
+      originalDone.value = Boolean(transcriptView.value.trim())
+      return true
+    }
+  }
+  return false
+}
+
+const reloadSnapshotBusy = ref(false)
+
+async function reloadFromServer() {
+  if (!consultationId.value) return
+  reloadSnapshotBusy.value = true
+  try {
+    await loadConsultation(consultationId.value)
+    if (transcriptView.value.trim() || protocolText.value.trim()) {
+      originalDone.value = Boolean(transcriptView.value.trim())
+      setStatus('Данные с сервера обновлены.', 'ok')
+    } else {
+      setStatus('Для этой консультации на сервере пока пустой черновик (транскрипт/протокол).', 'ok')
+    }
+  } catch (e: unknown) {
+    setStatus(e instanceof Error ? e.message : String(e), 'err')
+  } finally {
+    reloadSnapshotBusy.value = false
+  }
+}
+
 function floatToInt16Downsample(input: Float32Array, inRate: number, outRate: number): ArrayBuffer {
   if (inRate === outRate) {
     const out = new Int16Array(input.length)
@@ -195,21 +257,20 @@ async function doFinalize() {
       downloadText('протокол.txt', r.protocol_txt)
     }, 500)
   } catch (e: unknown) {
-    if (isAxiosError(e) && e.response?.status === 524) {
-      try {
-        await loadConsultation(consultationId.value)
-      } catch {
-        /* ignore */
-      }
-      if (transcriptView.value.trim() || protocolText.value.trim()) {
-        originalDone.value = Boolean(transcriptView.value.trim())
+    if (finalizeErrorLooksLikeProxyTimeout(e)) {
+      setStatus(
+        'Таймаут прокси (524/504): ответ не дошёл, но сервер может ещё писать черновик — подождём и несколько раз запросим снимок…',
+        'ok',
+      )
+      const recovered = await recoverSnapshotFromServer(consultationId.value)
+      if (recovered) {
         setStatus(
-          'Таймаут ответа (524): обработка на сервере могла уже завершиться — данные подгружены из сохранённого черновика. Проверьте «Транскрипт» и «Протокол».',
+          'Черновик подгружен с сервера (транскрипт/протокол). При таймауте прокси обработка часто заканчивается позже первого ответа.',
           'ok',
         )
       } else {
         setStatus(
-          'Таймаут 524: прокси (часто Cloudflare ~100 с) оборвал ожидание до ответа сервера. Увеличьте таймаут или настройте доступ к API без короткого лимита — см. deploy/CLOUDFLARE_TUNNEL.md.',
+          'Таймаут прокси: черновик на сервере так и не появился за отведённое время. Обновите страницу позже или нажмите «Подгрузить с сервера». Долгий ответ — см. deploy/CLOUDFLARE_TUNNEL.md.',
           'err',
         )
       }
@@ -331,6 +392,9 @@ function togglePause() {
         <button v-if="!recording" type="button" @click="startMic">Начать запись</button>
         <button v-else type="button" class="danger" @click="stopMic">Остановить запись</button>
         <button type="button" :disabled="busy" @click="saveSnapshot">Сохранить черновик</button>
+        <button type="button" :disabled="reloadSnapshotBusy || !consultationId" @click="reloadFromServer">
+          Подгрузить с сервера
+        </button>
         <button type="button" :disabled="busy" @click="resetBuf">Сбросить буфер PCM</button>
       </div>
       <p v-if="statusMsg" :class="statusKind === 'ok' ? 'info' : 'err'">{{ statusMsg }}</p>
