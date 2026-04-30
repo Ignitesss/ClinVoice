@@ -20,6 +20,7 @@ from clinvoice_protocol_io import (
     build_structured_protocol_txt,
     format_consultation_date_gmt3,
 )
+from clinvoice_transcript_clean import strip_whisper_tv_caption_artifacts
 from protocol import fill_protocol_from_transcript, format_protocol_editor_text
 from backend.services.audio_session import drop_audio_session, get_audio_session
 
@@ -194,8 +195,12 @@ async def finalize(
                     pass
 
     whisper_txt = await asyncio.to_thread(_run_whisper)
+    whisper_txt = strip_whisper_tv_caption_artifacts(whisper_txt)
     if not whisper_txt:
-        raise HTTPException(status_code=400, detail="Whisper вернул пустой текст")
+        raise HTTPException(
+            status_code=400,
+            detail="Текст после распознавания пуст (слишком короткая запись, шум или типичный артефакт модели).",
+        )
 
     await asyncio.sleep(resolve_protocol_delay_sec())
 

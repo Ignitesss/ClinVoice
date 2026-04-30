@@ -112,6 +112,7 @@ async function loadConsultation(id: string) {
 async function startMic() {
   if (recording.value) return
   clearStatus()
+  recordPaused.value = false
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
   audioCtx = new AudioContext()
   const inRate = audioCtx.sampleRate
@@ -134,6 +135,7 @@ async function startMic() {
 
 function stopMic() {
   recording.value = false
+  recordPaused.value = false
   processor?.disconnect()
   sourceNode?.disconnect()
   processor = null
@@ -142,6 +144,7 @@ function stopMic() {
   mediaStream = null
   void audioCtx?.close()
   audioCtx = null
+  sendPause()
 }
 
 async function saveSnapshot() {
@@ -177,6 +180,7 @@ async function resetBuf() {
 
 async function doFinalize() {
   if (!consultationId.value) return
+  stopMic()
   finalizing.value = true
   liveError.value = ''
   try {
@@ -289,13 +293,22 @@ function togglePause() {
 
     <section class="card">
       <h2>Запись</h2>
-      <label class="row">
-        <input v-model="recordPaused" type="checkbox" @change="togglePause" />
+      <p class="hint">
+        <strong>Пауза</strong> — при включённой записи не отправлять звук на сервер (микрофон остаётся включённым).
+        <strong>Остановить запись</strong> — полностью выключить микрофон.
+      </p>
+      <label class="row pause-row" :class="{ disabled: !recording }">
+        <input
+          v-model="recordPaused"
+          type="checkbox"
+          :disabled="!recording"
+          @change="togglePause"
+        />
         Пауза
       </label>
       <div class="row">
-        <button v-if="!recording" type="button" @click="startMic">Начать запись с микрофона</button>
-        <button v-else type="button" class="danger" @click="stopMic">Остановить микрофон</button>
+        <button v-if="!recording" type="button" @click="startMic">Начать запись</button>
+        <button v-else type="button" class="danger" @click="stopMic">Остановить запись</button>
         <button type="button" :disabled="busy" @click="saveSnapshot">Сохранить черновик</button>
         <button type="button" :disabled="busy" @click="resetBuf">Сбросить буфер PCM</button>
       </div>
@@ -304,7 +317,12 @@ function togglePause() {
     </section>
 
     <section class="card">
-      <h2>Черновик</h2>
+      <div class="draft-head">
+        <h2>Черновик</h2>
+        <button type="button" :disabled="finalizing || !consultationId" class="finalize-btn" @click="doFinalize">
+          {{ finalizing ? 'Обработка…' : 'Заполнить протокол' }}
+        </button>
+      </div>
       <pre class="draft">{{ draft || '—' }}</pre>
     </section>
 
@@ -318,9 +336,6 @@ function togglePause() {
       <h2>Протокол</h2>
       <textarea v-model="protocolText" rows="14" class="proto" placeholder="Дата:, Жалобы:, …" />
       <div class="row">
-        <button type="button" :disabled="finalizing || !consultationId" @click="doFinalize">
-          {{ finalizing ? 'Обработка…' : 'Заполнить протокол' }}
-        </button>
         <button type="button" :disabled="!protocolText" @click="downloadText('протокол.txt', protocolText)">
           Скачать протокол .txt
         </button>
@@ -331,12 +346,8 @@ function togglePause() {
 
 <style scoped>
 .page {
-  max-width: 880px;
-  margin: 0 auto;
-  padding: 1rem 1.25rem 3rem;
-  font-family: system-ui, sans-serif;
-  color: #000;
-  background: #fff;
+  width: 100%;
+  padding: 0 0.15rem 2rem;
 }
 .head {
   display: flex;
@@ -344,36 +355,53 @@ function togglePause() {
   justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
-  padding-bottom: 0.75rem;
-  border-bottom: 1px solid #000;
-}
-h1 {
-  margin: 0;
-  font-size: 1.35rem;
-  color: #000;
+  padding-bottom: 0.85rem;
+  margin-bottom: 0.25rem;
+  border-bottom: 1px solid var(--border);
 }
 .actions {
   display: flex;
-  gap: 0.75rem;
+  gap: 0.65rem;
+  flex-wrap: wrap;
 }
 .muted {
-  color: #000;
+  color: var(--text);
 }
 .small {
-  font-size: 0.85rem;
+  font-size: 0.9rem;
   word-break: break-all;
 }
 .card {
-  border: 1px solid #000;
-  border-radius: 0;
-  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--clinvoice-radius);
+  padding: 1.1rem 1.15rem;
   margin-top: 1rem;
-  background: #fff;
+  background: var(--bg);
+  box-shadow: var(--shadow);
 }
-h2 {
+.hint {
+  font-size: 0.88rem;
   margin: 0 0 0.75rem;
-  font-size: 1.05rem;
-  color: #000;
+  line-height: 1.45;
+  color: var(--text);
+}
+.hint strong {
+  font-weight: 600;
+  color: var(--text-h);
+}
+.draft-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.75rem;
+}
+.draft-head h2 {
+  margin: 0;
+}
+.pause-row.disabled {
+  opacity: 0.45;
 }
 .row {
   display: flex;
@@ -381,74 +409,23 @@ h2 {
   gap: 0.5rem;
   align-items: center;
   margin-top: 0.5rem;
-  color: #000;
-}
-.row input[type='checkbox'] {
-  width: 1rem;
-  height: 1rem;
-  accent-color: #000;
-}
-button {
-  padding: 0.45rem 0.75rem;
-  border-radius: 0;
-  border: 1px solid #000;
-  background: #fff;
-  color: #000;
-  cursor: pointer;
-}
-button.linkish {
-  border: none;
-  background: transparent;
-  color: #1a5f7a;
-  text-decoration: underline;
-  padding: 0.25rem 0.35rem;
-}
-button.linkish:hover {
-  color: #0d4a63;
-}
-button:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-button.danger {
-  border-color: #000;
-  color: #000;
+  color: var(--text);
 }
 .draft {
   white-space: pre-wrap;
   margin: 0;
-  padding: 0.75rem;
-  background: #fff;
-  border: 1px solid #000;
-  border-radius: 0;
+  padding: 0.85rem;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--clinvoice-radius);
   min-height: 3rem;
-  font-size: 0.9rem;
-  color: #000;
+  font-size: 0.92rem;
+  color: var(--text-h);
+  font-family: var(--mono, ui-monospace, monospace);
 }
 .proto {
   width: 100%;
   box-sizing: border-box;
-  font-family: inherit;
-  font-size: 0.9rem;
-  padding: 0.5rem;
-  border-radius: 0;
-  border: 1px solid #000;
-  background: #fff;
-  color: #000;
-}
-.info {
-  color: #15601d;
-  margin: 0.5rem 0 0;
-}
-.err {
-  color: #a40000;
-  margin: 0.5rem 0 0;
-}
-code {
-  font-size: 0.85rem;
-  padding: 0.15rem 0.35rem;
-  border: 1px solid #000;
-  background: #fff;
-  color: #000;
+  margin-top: 0.35rem;
 }
 </style>
