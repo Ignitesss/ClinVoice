@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onBeforeUnmount, watch, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { isAxiosError } from 'axios'
 import * as api from '../api'
 
 const route = useRoute()
@@ -194,7 +195,27 @@ async function doFinalize() {
       downloadText('протокол.txt', r.protocol_txt)
     }, 500)
   } catch (e: unknown) {
-    setStatus(e instanceof Error ? e.message : String(e), 'err')
+    if (isAxiosError(e) && e.response?.status === 524) {
+      try {
+        await loadConsultation(consultationId.value)
+      } catch {
+        /* ignore */
+      }
+      if (transcriptView.value.trim() || protocolText.value.trim()) {
+        originalDone.value = Boolean(transcriptView.value.trim())
+        setStatus(
+          'Таймаут ответа (524): обработка на сервере могла уже завершиться — данные подгружены из сохранённого черновика. Проверьте «Транскрипт» и «Протокол».',
+          'ok',
+        )
+      } else {
+        setStatus(
+          'Таймаут 524: прокси (часто Cloudflare ~100 с) оборвал ожидание до ответа сервера. Увеличьте таймаут или настройте доступ к API без короткого лимита — см. deploy/CLOUDFLARE_TUNNEL.md.',
+          'err',
+        )
+      }
+    } else {
+      setStatus(e instanceof Error ? e.message : String(e), 'err')
+    }
   } finally {
     finalizing.value = false
   }
@@ -330,6 +351,15 @@ function togglePause() {
       <h2>Транскрипт</h2>
       <p v-if="!originalDone" class="muted small">После «Заполнить протокол» здесь появится уточнённый текст.</p>
       <pre class="draft">{{ transcriptView || '—' }}</pre>
+      <div class="row">
+        <button
+          type="button"
+          :disabled="!transcriptView.trim()"
+          @click="downloadText('транскрипт.txt', transcriptView)"
+        >
+          Скачать транскрипт .txt
+        </button>
+      </div>
     </section>
 
     <section class="card">

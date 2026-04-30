@@ -63,6 +63,7 @@ export async function resetAudio(id: string) {
   await http.post(`/api/consultations/${encodeURIComponent(id)}/reset-audio`)
 }
 
+/** Whisper + протокол могут занимать много минут; 0 = без лимита на стороне axios (прокси может оборвать раньше). */
 export async function finalizeConsultation(id: string) {
   const { data } = await http.post<{
     transcription: string
@@ -71,6 +72,8 @@ export async function finalizeConsultation(id: string) {
     protocol_consultation_date: string
     transcript_txt: string
     protocol_txt: string
-  }>(`/api/consultations/${encodeURIComponent(id)}/finalize`)
+  }>(`/api/consultations/${encodeURIComponent(id)}/finalize`, undefined, {
+    timeout: 0,
+  })
   return data
 }
