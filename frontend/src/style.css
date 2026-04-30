@@ -3,16 +3,16 @@
 :root {
   --clinvoice-radius: 12px;
 
-  /* ClinVoice: бежево-зелёная тема, тёмный текст (не зависит от «тёмной» ОС) */
+  /* ClinVoice: жёлто-зелёная тема (#f9ec69), тёмный текст */
   --text: #3d3a34;
   --text-h: #141210;
-  --bg: #f4eedf;
-  --border: #cfc4b2;
-  --code-bg: #e8e0d0;
+  --bg: #f9ec69;
+  --border: #c4b02e;
+  --code-bg: #f0e25a;
   --accent: #2f6f4e;
   --accent-bg: rgba(47, 111, 78, 0.14);
   --accent-border: rgba(47, 111, 78, 0.42);
-  --social-bg: rgba(232, 224, 208, 0.85);
+  --social-bg: rgba(240, 226, 90, 0.75);
   --shadow:
     rgba(28, 27, 24, 0.07) 0 10px 15px -3px,
     rgba(28, 27, 24, 0.04) 0 4px 6px -2px;
@@ -24,13 +24,13 @@
   :root {
     --text: #2a2824;
     --text-h: #0f0e0c;
-    --bg: #e8e2d4;
-    --border: #c4b9a6;
-    --code-bg: #ded5c4;
+    --bg: #f0e456;
+    --border: #b5a22a;
+    --code-bg: #e8d94a;
     --accent: #27624a;
     --accent-bg: rgba(39, 98, 74, 0.18);
     --accent-border: rgba(39, 98, 74, 0.48);
-    --social-bg: rgba(216, 208, 192, 0.65);
+    --social-bg: rgba(232, 217, 74, 0.7);
     --shadow:
       rgba(18, 16, 14, 0.1) 0 10px 15px -3px,
       rgba(18, 16, 14, 0.05) 0 4px 6px -2px;
