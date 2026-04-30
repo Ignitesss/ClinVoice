@@ -185,6 +185,10 @@ async function doFinalize() {
     protocolText.value = r.protocol_editor_text
     originalDone.value = true
     setStatus('Готово: текст и протокол обновлены.', 'ok')
+    downloadText('транскрипт.txt', r.transcript_txt)
+    window.setTimeout(() => {
+      downloadText('протокол.txt', r.protocol_txt)
+    }, 500)
   } catch (e: unknown) {
     setStatus(e instanceof Error ? e.message : String(e), 'err')
   } finally {
@@ -195,10 +199,17 @@ async function doFinalize() {
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
   const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
+  const url = URL.createObjectURL(blob)
+  a.href = url
   a.download = filename
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(a.href)
+  window.setTimeout(() => {
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, 1500)
 }
 
 async function newConsultation() {
