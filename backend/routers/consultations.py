@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 import clinvoice_db
-from backend.deps import get_current_user_id, get_db_path, get_transcriber
+from backend.deps import get_current_user_id, get_db_path
 from backend.settings import resolve_protocol_delay_sec
-from clinvoice_asr import WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS, transcribe_wav_in_chunks
-from clinvoice_audio_utils import pcm_mono_s16le_to_wav_bytes
 from clinvoice_protocol_io import (
     build_structured_protocol_txt,
     format_consultation_date_gmt3,
@@ -155,7 +151,6 @@ def reset_audio(
 @router.post("/{consultation_id}/finalize")
 async def finalize(
     consultation_id: str,
-    request: Request,
     user_id: int = Depends(get_current_user_id),
     db_path: str = Depends(get_db_path),
 ) -> dict:
@@ -169,37 +164,11 @@ async def finalize(
     if len(pcm) < 3200:
         raise HTTPException(status_code=400, detail="Слишком короткая запись для Whisper")
 
-    sk_live = sess.draft_text()
-    _ip = sk_live[:WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS] if sk_live else None
-
-    transcriber = get_transcriber(request)
-
-    def _run_whisper() -> str:
-        fd, wav_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        try:
-            with open(wav_path, "wb") as wf:
-                wf.write(pcm_mono_s16le_to_wav_bytes(pcm))
-            return transcribe_wav_in_chunks(
-                transcriber,
-                wav_path,
-                language="ru",
-                draft=False,
-                initial_prompt=_ip,
-            ).strip()
-        finally:
-            if os.path.isfile(wav_path):
-                try:
-                    os.remove(wav_path)
-                except OSError:
-                    pass
-
-    whisper_txt = await asyncio.to_thread(_run_whisper)
-    whisper_txt = strip_whisper_tv_caption_artifacts(whisper_txt)
+    whisper_txt = strip_whisper_tv_caption_artifacts(sess.draft_text())
     if not whisper_txt:
         raise HTTPException(
             status_code=400,
-            detail="Текст после распознавания пуст (слишком короткая запись, шум или типичный артефакт модели).",
+            detail="Черновик транскрипта пуст. Дождитесь появления текста во время записи или проверьте микрофон.",
         )
 
     await asyncio.sleep(resolve_protocol_delay_sec())

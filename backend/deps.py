@@ -69,15 +69,19 @@ def get_current_user_id(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверная сессия")
 
 
-def get_transcriber(request: Request) -> AudioTranscriberWithMetrics:
-    lock: threading.Lock = request.app.state.transcriber_lock
+def get_transcriber_for_app(app) -> AudioTranscriberWithMetrics:
+    lock: threading.Lock = app.state.transcriber_lock
     with lock:
-        if request.app.state.transcriber is None:
+        if app.state.transcriber is None:
             hub = resolve_hub_model_id()
             log.info("Загрузка ASR (hub=%s)", hub or "(openai)")
-            request.app.state.transcriber = AudioTranscriberWithMetrics(
+            app.state.transcriber = AudioTranscriberWithMetrics(
                 model_size="small",
                 hub_model_id=hub or None,
                 silent_ui=True,
             )
-        return request.app.state.transcriber
+        return app.state.transcriber
+
+
+def get_transcriber(request: Request) -> AudioTranscriberWithMetrics:
+    return get_transcriber_for_app(request.app)

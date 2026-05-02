@@ -135,7 +135,8 @@ function connectWs() {
       try {
         const msg = JSON.parse(ev.data) as { type: string; text?: string; message?: string }
         if (msg.type === 'draft' && msg.text !== undefined) draft.value = msg.text
-        if (msg.type === 'speechkit_error' && msg.message) liveError.value = msg.message
+        if ((msg.type === 'draft_error' || msg.type === 'speechkit_error') && msg.message)
+          liveError.value = msg.message
         if (msg.type === 'warn' && msg.message) setStatus(msg.message, 'ok')
         if (msg.type === 'error' && msg.message) liveError.value = msg.message
       } catch {

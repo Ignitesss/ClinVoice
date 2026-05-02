@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.deps import COOKIE_NAME, decode_token
+from backend.deps import COOKIE_NAME, decode_token, get_transcriber_for_app
 from backend.services.audio_session import get_audio_session
+from clinvoice_asr import WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS, transcribe_pcm_s16le_mono
 from clinvoice_audio_ingest import decode_audio_chunk, resample_pcm_s16le_mono
 from clinvoice_audio_utils import TARGET_SAMPLE_RATE_HZ
-from protocol import resolve_yandex_folder_id
-from yandex_speechkit_stt import recognize_lpcm16k_mono_chunk, speechkit_configured
-
-log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websocket"])
 
@@ -63,20 +59,20 @@ async def audio_stream(websocket: WebSocket) -> None:
         return
 
     sess = get_audio_session(cid)
-    fid = (resolve_yandex_folder_id() or "").strip()
-    if speechkit_configured() and fid:
+    transcriber = get_transcriber_for_app(websocket.app)
 
-        def _rec(chunk: bytes, folder_id: str) -> str:
-            return recognize_lpcm16k_mono_chunk(chunk, folder_id)
-
-        sess.ensure_speechkit(fid, _rec)
-    else:
-        await websocket.send_json(
-            {
-                "type": "warn",
-                "message": "Живой черновик недоступен (проверьте ключи облака); запись накапливается.",
-            }
+    def _recognize_whisper(pcm_chunk: bytes, prev_draft: str) -> str:
+        p = (prev_draft or "").strip()
+        ip = p[-WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS:] if p else None
+        return transcribe_pcm_s16le_mono(
+            transcriber,
+            pcm_chunk,
+            language="ru",
+            draft=True,
+            initial_prompt=ip,
         )
+
+    sess.ensure_live_draft(_recognize_whisper, overlap_bytes=0)
 
     last_draft = ""
     last_err = None
@@ -94,7 +90,7 @@ async def audio_stream(websocket: WebSocket) -> None:
                 if e != last_err:
                     last_err = e
                     if e:
-                        await websocket.send_json({"type": "speechkit_error", "message": e})
+                        await websocket.send_json({"type": "draft_error", "message": e})
             except Exception:
                 break
 

@@ -240,6 +240,37 @@ def transcribe_wav_in_chunks(
     return " ".join(p.strip() for p in parts if p.strip()).strip()
 
 
+def transcribe_pcm_s16le_mono(
+    transcriber: "AudioTranscriberWithMetrics",
+    pcm_s16le: bytes,
+    *,
+    language: str = "ru",
+    draft: bool = False,
+    initial_prompt: Optional[str] = None,
+) -> str:
+    """Временный WAV из PCM mono 16 kHz → распознавание (в т.ч. длинные чанки по частям)."""
+    if not pcm_s16le:
+        return ""
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with open(wav_path, "wb") as wf:
+            wf.write(pcm_mono_s16le_to_wav_bytes(pcm_s16le))
+        return transcribe_wav_in_chunks(
+            transcriber,
+            wav_path,
+            language=language,
+            draft=draft,
+            initial_prompt=initial_prompt,
+        ).strip()
+    finally:
+        if os.path.isfile(wav_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+
+
 class AudioTranscriberWithMetrics:
     def __init__(
         self,
@@ -425,5 +456,6 @@ __all__ = [
     "resolve_asr_chunk_seconds",
     "resolve_hub_model_id",
     "resolve_whisper_engine",
+    "transcribe_pcm_s16le_mono",
     "transcribe_wav_in_chunks",
 ]

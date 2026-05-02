@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Состояние консультации в памяти: PCM, SpeechKit, ссылка на фоновый цикл."""
+"""Состояние консультации в памяти: PCM, фоновый цикл живого черновика (Whisper)."""
 
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from clinvoice_audio_utils import max_pcm_bytes
 
 if TYPE_CHECKING:
-    from backend.services.speechkit_live import SpeechKitBackgroundLoop
+    from backend.services.live_draft_loop import LiveDraftBackgroundLoop
 
 
 def _empty_shared() -> Dict[str, Any]:
@@ -17,9 +17,9 @@ def _empty_shared() -> Dict[str, Any]:
         "lock": threading.Lock(),
         "pcm_accum": bytearray(),
         "recording_paused": False,
-        "speechkit_pcm_committed": 0,
-        "live_speechkit_text": "",
-        "live_speechkit_error": None,
+        "draft_pcm_committed": 0,
+        "live_draft_text": "",
+        "live_draft_error": None,
     }
 
 
@@ -27,19 +27,26 @@ class ConsultationAudioSession:
     def __init__(self, consultation_id: str) -> None:
         self.consultation_id = consultation_id
         self.shared = _empty_shared()
-        self._speechkit_loop: Optional[SpeechKitBackgroundLoop] = None
+        self._draft_loop: Optional["LiveDraftBackgroundLoop"] = None
 
-    def ensure_speechkit(self, folder_id: str, recognize) -> None:
-        if self._speechkit_loop is not None:
+    def ensure_live_draft(
+        self,
+        recognize: Callable[[bytes, str], str],
+        *,
+        overlap_bytes: int = 0,
+    ) -> None:
+        if self._draft_loop is not None:
             return
-        from backend.services.speechkit_live import SpeechKitBackgroundLoop
+        from backend.services.live_draft_loop import LiveDraftBackgroundLoop
 
-        self._speechkit_loop = SpeechKitBackgroundLoop(self.shared, folder_id, recognize)
+        self._draft_loop = LiveDraftBackgroundLoop(
+            self.shared, recognize, overlap_bytes=overlap_bytes
+        )
 
-    def stop_speechkit(self) -> None:
-        if self._speechkit_loop is not None:
-            self._speechkit_loop.stop()
-            self._speechkit_loop = None
+    def stop_live_draft(self) -> None:
+        if self._draft_loop is not None:
+            self._draft_loop.stop()
+            self._draft_loop = None
 
     def append_pcm(self, pcm: bytes) -> None:
         if not pcm:
@@ -53,8 +60,8 @@ class ConsultationAudioSession:
             if len(acc) + len(pcm) > cap:
                 overflow = len(acc) + len(pcm) - cap
                 del acc[:overflow]
-                c0 = int(self.shared.get("speechkit_pcm_committed") or 0)
-                self.shared["speechkit_pcm_committed"] = max(0, c0 - overflow)
+                c0 = int(self.shared.get("draft_pcm_committed") or 0)
+                self.shared["draft_pcm_committed"] = max(0, c0 - overflow)
             acc.extend(pcm)
 
     def set_paused(self, paused: bool) -> None:
@@ -64,9 +71,9 @@ class ConsultationAudioSession:
     def clear_buffer(self) -> None:
         with self.shared["lock"]:
             self.shared["pcm_accum"] = bytearray()
-            self.shared["live_speechkit_text"] = ""
-            self.shared["live_speechkit_error"] = None
-            self.shared["speechkit_pcm_committed"] = 0
+            self.shared["live_draft_text"] = ""
+            self.shared["live_draft_error"] = None
+            self.shared["draft_pcm_committed"] = 0
 
     def copy_pcm(self) -> bytes:
         with self.shared["lock"]:
@@ -74,11 +81,11 @@ class ConsultationAudioSession:
 
     def draft_text(self) -> str:
         with self.shared["lock"]:
-            return (self.shared.get("live_speechkit_text") or "").strip()
+            return (self.shared.get("live_draft_text") or "").strip()
 
     def draft_error(self) -> Optional[str]:
         with self.shared["lock"]:
-            e = self.shared.get("live_speechkit_error")
+            e = self.shared.get("live_draft_error")
             return str(e) if e else None
 
 
@@ -99,4 +106,4 @@ def drop_audio_session(consultation_id: str) -> None:
     with _sessions_lock:
         s = _sessions.pop(consultation_id, None)
     if s:
-        s.stop_speechkit()
+        s.stop_live_draft()

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Фоновый цикл Yandex SpeechKit по накопленному PCM (как speechkit_webrtc, без WebRTC)."""
+"""Фоновый цикл «живого» черновика по накопленному PCM (Whisper по чанкам)."""
 
 from __future__ import annotations
 
@@ -8,12 +8,10 @@ import os
 import threading
 from typing import Any, Callable, Dict, Optional
 
-from clinvoice_audio_utils import max_pcm_bytes
-
 log = logging.getLogger(__name__)
 
 
-def resolve_live_speechkit_interval_sec() -> float:
+def resolve_live_draft_interval_sec() -> float:
     raw = (os.environ.get("CLINVOICE_LIVE_WHISPER_INTERVAL_SEC") or "").strip()
     default = 5.0
     if not raw:
@@ -52,42 +50,45 @@ def resolve_draft_min_new_seconds() -> float:
     return max(0.2, min(5.0, v))
 
 
-def resolve_draft_tail_overlap_sec() -> float:
+def resolve_draft_tail_overlap_bytes() -> int:
+    """Для облачного STT с перекрытием окон; для Whisper по умолчанию 0 (без дублей в тексте)."""
     raw = (os.environ.get("CLINVOICE_DRAFT_TAIL_OVERLAP_SEC") or "").strip()
     if not raw:
-        return 0.35
+        return 0
     try:
         v = float(raw)
     except ValueError:
-        return 0.35
-    return max(0.0, min(3.0, v))
+        return 0
+    sec = max(0.0, min(3.0, v))
+    return int(sec * 32000)
 
 
-class SpeechKitBackgroundLoop:
-    """Пишет в shared: live_speechkit_text, live_speechkit_error, speechkit_pcm_committed."""
+class LiveDraftBackgroundLoop:
+    """Пишет в shared: live_draft_text, live_draft_error, draft_pcm_committed."""
 
     def __init__(
         self,
         shared: Dict[str, Any],
-        folder_id: str,
         recognize: Callable[[bytes, str], str],
+        *,
         interval_sec: Optional[float] = None,
+        overlap_bytes: Optional[int] = None,
     ) -> None:
         self._shared = shared
-        self._folder_id = folder_id
         self._recognize = recognize
-        iv = interval_sec if interval_sec is not None else resolve_live_speechkit_interval_sec()
+        iv = interval_sec if interval_sec is not None else resolve_live_draft_interval_sec()
         self._interval = max(0.8, float(iv))
         self._max_segment_bytes = int(resolve_draft_tail_max_seconds() * 32000)
         self._min_new_bytes = int(resolve_draft_min_new_seconds() * 32000)
-        self._overlap_bytes = int(resolve_draft_tail_overlap_sec() * 32000)
+        ov = resolve_draft_tail_overlap_bytes() if overlap_bytes is None else int(overlap_bytes)
+        self._overlap_bytes = max(0, ov)
         self._stop = threading.Event()
         lk = shared.get("lock")
         if lk:
             with lk:
-                shared["speechkit_pcm_committed"] = 0
-                shared["live_speechkit_text"] = ""
-                shared["live_speechkit_error"] = None
+                shared["draft_pcm_committed"] = 0
+                shared["live_draft_text"] = ""
+                shared["live_draft_error"] = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -106,7 +107,7 @@ class SpeechKitBackgroundLoop:
             with lk:
                 paused = bool(self._shared.get("recording_paused"))
                 pcm = bytes(self._shared.get("pcm_accum") or b"")
-                committed = int(self._shared.get("speechkit_pcm_committed") or 0)
+                committed = int(self._shared.get("draft_pcm_committed") or 0)
             if paused:
                 continue
             n = len(pcm)
@@ -114,24 +115,26 @@ class SpeechKitBackgroundLoop:
                 continue
             take = min(n - committed, self._max_segment_bytes)
             ov = min(self._overlap_bytes, committed)
-            start = committed - ov
+            start = max(0, committed - ov)
             chunk = pcm[start : committed + take]
+            prev = ""
+            with lk:
+                prev = (self._shared.get("live_draft_text") or "").strip()
             try:
-                text = self._recognize(chunk, self._folder_id).strip()
+                text = self._recognize(chunk, prev).strip()
             except Exception as e:
-                log.warning("SpeechKit: %s", e)
+                log.warning("Live draft ASR: %s", e)
                 with lk:
-                    self._shared["live_speechkit_error"] = str(e)
+                    self._shared["live_draft_error"] = str(e)
                 continue
             if self._stop.is_set():
                 break
             with lk:
-                self._shared["live_speechkit_error"] = None
-                prev = (self._shared.get("live_speechkit_text") or "").strip()
+                self._shared["live_draft_error"] = None
                 t = (text or "").strip()
                 if t:
                     if prev:
-                        self._shared["live_speechkit_text"] = (prev + " " + t).strip()
+                        self._shared["live_draft_text"] = (prev + " " + t).strip()
                     else:
-                        self._shared["live_speechkit_text"] = t
-                self._shared["speechkit_pcm_committed"] = committed + take
+                        self._shared["live_draft_text"] = t
+                self._shared["draft_pcm_committed"] = committed + take
