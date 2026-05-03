@@ -33,7 +33,7 @@ DEFAULT_ASR_CHUNK_SECONDS = 30.0
 WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS = 2400
 
 _clinvoice_model_load_lock = threading.Lock()
-_clinvoice_fw_whisper_models: dict[tuple[str, str, str], object] = {}
+_clinvoice_fw_whisper_models: dict[tuple[str, str, str, int], object] = {}
 _clinvoice_openai_whisper_models: dict[tuple[str, str], object] = {}
 _transformers_bundles: dict[str, dict] = {}
 
@@ -81,6 +81,26 @@ def resolve_draft_vad_filter() -> bool:
     if raw in ("1", "true", "yes", "on"):
         return True
     return True
+
+
+def resolve_faster_whisper_compute_type(device_kw: str) -> str:
+    """Тип вычислений CTranslate2. Пусто: float16 на CUDA, int8 на CPU (быстрый путь на CPU)."""
+    raw = (_e("CLINVOICE_FW_COMPUTE_TYPE") or _e("CLINVOICE_WHISPER_COMPUTE_TYPE")).lower()
+    if raw:
+        return raw
+    return "float16" if device_kw == "cuda" else "int8"
+
+
+def resolve_faster_whisper_cpu_threads() -> int:
+    """Потоки CTranslate2 intra_threads на CPU; 0 = поведение faster-whisper по умолчанию."""
+    raw = _e("CLINVOICE_FW_CPU_THREADS")
+    if not raw:
+        return 0
+    try:
+        v = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(32, v))
 
 
 def _resolve_faster_whisper_no_speech_threshold(*, draft: bool) -> float:
@@ -159,18 +179,29 @@ def infer_whisper_processor_repo(hub_model_id: str) -> str:
     return "openai/whisper-small"
 
 
-def _load_faster_whisper_cached(repo_id: str, device_kw: str, compute_type: str):
+def _load_faster_whisper_cached(
+    repo_id: str, device_kw: str, compute_type: str, cpu_threads: int
+):
     from faster_whisper import WhisperModel
 
-    k = (str(repo_id), str(device_kw), str(compute_type))
+    k = (str(repo_id), str(device_kw), str(compute_type), int(cpu_threads))
     with _clinvoice_model_load_lock:
         if k not in _clinvoice_fw_whisper_models:
-            _clinvoice_fw_whisper_models[k] = WhisperModel(
-                repo_id,
-                device=device_kw,
-                compute_type=compute_type,
-                download_root=hf_hub_download_dir(),
-            )
+            if cpu_threads > 0:
+                _clinvoice_fw_whisper_models[k] = WhisperModel(
+                    repo_id,
+                    device=device_kw,
+                    compute_type=compute_type,
+                    cpu_threads=cpu_threads,
+                    download_root=hf_hub_download_dir(),
+                )
+            else:
+                _clinvoice_fw_whisper_models[k] = WhisperModel(
+                    repo_id,
+                    device=device_kw,
+                    compute_type=compute_type,
+                    download_root=hf_hub_download_dir(),
+                )
         return _clinvoice_fw_whisper_models[k]
 
 
@@ -290,10 +321,11 @@ class AudioTranscriberWithMetrics:
             if not silent_ui:
                 log.info("Загрузка faster-whisper с Hub: %s", hub_model_id)
             device_kw = "cuda" if self.device.type == "cuda" else "cpu"
-            compute_type = "float16" if device_kw == "cuda" else "int8"
+            compute_type = resolve_faster_whisper_compute_type(device_kw)
+            cpu_threads = resolve_faster_whisper_cpu_threads()
             try:
                 self.faster_model = _load_faster_whisper_cached(
-                    hub_model_id, device_kw, compute_type
+                    hub_model_id, device_kw, compute_type, cpu_threads
                 )
             except ImportError as e:
                 raise RuntimeError("Нужен пакет faster-whisper") from e
@@ -454,6 +486,8 @@ __all__ = [
     "openai_whisper_download_dir",
     "pcm_bytes_to_transcribe_path",
     "resolve_asr_chunk_seconds",
+    "resolve_faster_whisper_compute_type",
+    "resolve_faster_whisper_cpu_threads",
     "resolve_hub_model_id",
     "resolve_whisper_engine",
     "transcribe_pcm_s16le_mono",
