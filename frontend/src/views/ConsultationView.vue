@@ -23,6 +23,55 @@ const originalDone = ref(false)
 
 const recording = ref(false)
 
+/** Накопительное время записи в текущей консультации (мс), сброс при смене id / сбросе буфера */
+const accumulatedRecordingMs = ref(0)
+/** Начало текущего непрерывного отрезка «идёт запись» */
+let recordingSegmentStart: number | null = null
+let recordingTickTimer: ReturnType<typeof setInterval> | null = null
+const RECORDING_LIMIT_MS = 25 * 60 * 1000
+
+const recordingDisplayMs = ref(0)
+
+function clearRecordingTickTimer() {
+  if (recordingTickTimer !== null) {
+    clearInterval(recordingTickTimer)
+    recordingTickTimer = null
+  }
+}
+
+function commitRecordingSegment() {
+  if (recordingSegmentStart !== null) {
+    accumulatedRecordingMs.value += Math.max(0, Date.now() - recordingSegmentStart)
+    recordingSegmentStart = null
+  }
+  recordingDisplayMs.value = Math.min(accumulatedRecordingMs.value, RECORDING_LIMIT_MS)
+}
+
+function resetRecordingTimer() {
+  clearRecordingTickTimer()
+  commitRecordingSegment()
+  accumulatedRecordingMs.value = 0
+  recordingDisplayMs.value = 0
+}
+
+function formatMs(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  const m = Math.floor(s / 60)
+  const sec = s % 60
+  return `${m}:${sec.toString().padStart(2, '0')}`
+}
+
+const recordingTimerLabel = computed(() => {
+  const cur = Math.min(recordingDisplayMs.value, RECORDING_LIMIT_MS)
+  return `${formatMs(cur)} / ${formatMs(RECORDING_LIMIT_MS)}`
+})
+
+const transcriptDisplay = computed(() => {
+  if (originalDone.value) return transcriptView.value
+  if (draft.value.trim()) return draft.value
+  return transcriptView.value
+})
+
 let ws: WebSocket | null = null
 let audioCtx: AudioContext | null = null
 let mediaStream: MediaStream | null = null
@@ -186,10 +235,21 @@ async function startMic() {
   processor.connect(gain)
   gain.connect(audioCtx.destination)
   recording.value = true
+  recordingSegmentStart = Date.now()
+  clearRecordingTickTimer()
+  recordingTickTimer = window.setInterval(() => {
+    if (recordingSegmentStart === null) return
+    recordingDisplayMs.value = Math.min(
+      accumulatedRecordingMs.value + (Date.now() - recordingSegmentStart),
+      RECORDING_LIMIT_MS,
+    )
+  }, 250)
 }
 
 function stopMic() {
   recording.value = false
+  clearRecordingTickTimer()
+  commitRecordingSegment()
   processor?.disconnect()
   sourceNode?.disconnect()
   processor = null
@@ -206,10 +266,10 @@ async function saveSnapshot() {
   try {
     await api.putSnapshot(consultationId.value, {
       protocol_editor_text: protocolText.value,
-      doctor_transcript_editor: transcriptView.value,
-      live_transcript_editor: transcriptView.value,
+      doctor_transcript_editor: transcriptDisplay.value,
+      live_transcript_editor: transcriptDisplay.value,
     })
-    setStatus('Черновик сохранён', 'ok')
+    setStatus('Снимок сохранён', 'ok')
   } catch (e: unknown) {
     setStatus(e instanceof Error ? e.message : String(e), 'err')
   } finally {
@@ -223,6 +283,7 @@ async function resetBuf() {
   try {
     await api.resetAudio(consultationId.value)
     draft.value = ''
+    resetRecordingTimer()
     setStatus('Буфер PCM сброшен', 'ok')
   } catch (e: unknown) {
     setStatus(e instanceof Error ? e.message : String(e), 'err')
@@ -239,6 +300,7 @@ async function doFinalize() {
   try {
     const r = await api.finalizeConsultation(consultationId.value)
     transcriptView.value = r.transcription
+    draft.value = r.transcription
     protocolText.value = r.protocol_editor_text
     originalDone.value = true
     setStatus('Готово: текст и протокол обновлены.', 'ok')
@@ -328,6 +390,7 @@ watch(
       consultationId.value = id
     }
     stopMic()
+    resetRecordingTimer()
     ws?.close()
     try {
       await loadConsultation(consultationId.value)
@@ -342,6 +405,7 @@ watch(
 
 onBeforeUnmount(() => {
   stopMic()
+  clearRecordingTickTimer()
   ws?.close()
 })
 </script>
@@ -365,10 +429,14 @@ onBeforeUnmount(() => {
         <strong>Остановить запись</strong> — выключить микрофон. Кнопка «Заполнить протокол» сначала дорабатывает
         распознавание по всей записи, затем строит протокол (это может занять время).
       </p>
+      <p class="timer-line" :class="{ warn: recordingDisplayMs >= RECORDING_LIMIT_MS }">
+        Запись: <strong>{{ recordingTimerLabel }}</strong>
+        <span v-if="recordingDisplayMs >= RECORDING_LIMIT_MS" class="timer-cap"> (лимит 25 мин.)</span>
+      </p>
       <div class="row">
         <button v-if="!recording" type="button" @click="startMic">Начать запись</button>
         <button v-else type="button" class="danger" @click="stopMic">Остановить запись</button>
-        <button type="button" :disabled="busy" @click="saveSnapshot">Сохранить черновик</button>
+        <button type="button" :disabled="busy" @click="saveSnapshot">Сохранить снимок</button>
         <button type="button" :disabled="reloadSnapshotBusy || !consultationId" @click="reloadFromServer">
           Подгрузить с сервера
         </button>
@@ -380,27 +448,24 @@ onBeforeUnmount(() => {
 
     <section class="card">
       <div class="draft-head">
-        <h2>Черновик</h2>
-        <button type="button" :disabled="finalizing || !consultationId" class="finalize-btn" @click="doFinalize">
-          {{ finalizing ? 'Черновик и протокол…' : 'Заполнить протокол' }}
-        </button>
+        <h2>Транскрипт</h2>
+        <div class="draft-head-actions">
+          <button
+            type="button"
+            :disabled="!transcriptDisplay.trim()"
+            @click="downloadText('транскрипт.txt', transcriptDisplay)"
+          >
+            Скачать .txt
+          </button>
+          <button type="button" :disabled="finalizing || !consultationId" class="finalize-btn" @click="doFinalize">
+            {{ finalizing ? 'Транскрипт и протокол…' : 'Заполнить протокол' }}
+          </button>
+        </div>
       </div>
-      <pre class="draft">{{ draft || '—' }}</pre>
-    </section>
-
-    <section class="card">
-      <h2>Транскрипт</h2>
-      <p v-if="!originalDone" class="muted small">После «Заполнить протокол» здесь появится уточнённый текст.</p>
-      <pre class="draft">{{ transcriptView || '—' }}</pre>
-      <div class="row">
-        <button
-          type="button"
-          :disabled="!transcriptView.trim()"
-          @click="downloadText('транскрипт.txt', transcriptView)"
-        >
-          Скачать транскрипт .txt
-        </button>
-      </div>
+      <p v-if="!originalDone" class="muted small">
+        Текст появляется по мере распознавания. После «Заполнить протокол» здесь будет итоговый транскрипт.
+      </p>
+      <pre class="draft">{{ transcriptDisplay.trim() ? transcriptDisplay : '—' }}</pre>
     </section>
 
     <section class="card">
@@ -470,6 +535,24 @@ onBeforeUnmount(() => {
 }
 .draft-head h2 {
   margin: 0;
+}
+.draft-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+}
+.timer-line {
+  font-size: 0.95rem;
+  margin: 0 0 0.65rem;
+  color: var(--text);
+}
+.timer-line.warn strong {
+  color: #b45309;
+}
+.timer-cap {
+  font-size: 0.85rem;
+  color: var(--text);
 }
 .row {
   display: flex;
