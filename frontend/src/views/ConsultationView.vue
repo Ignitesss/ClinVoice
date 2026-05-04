@@ -22,7 +22,6 @@ const transcriptView = ref('')
 const originalDone = ref(false)
 
 const recording = ref(false)
-const recordPaused = ref(false)
 
 let ws: WebSocket | null = null
 let audioCtx: AudioContext | null = null
@@ -152,12 +151,6 @@ function connectWs() {
   }
 }
 
-function sendPause() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'pause', value: recordPaused.value }))
-  }
-}
-
 async function loadConsultation(id: string) {
   const data = await api.getConsultation(id)
   const snap = data.snapshot
@@ -176,14 +169,13 @@ async function loadConsultation(id: string) {
 async function startMic() {
   if (recording.value) return
   clearStatus()
-  recordPaused.value = false
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
   audioCtx = new AudioContext()
   const inRate = audioCtx.sampleRate
   sourceNode = audioCtx.createMediaStreamSource(mediaStream)
   processor = audioCtx.createScriptProcessor(4096, 1, 1)
   processor.onaudioprocess = (e) => {
-    if (!recording.value || recordPaused.value || !ws || ws.readyState !== WebSocket.OPEN) return
+    if (!recording.value || !ws || ws.readyState !== WebSocket.OPEN) return
     const input = e.inputBuffer.getChannelData(0)
     const buf = floatToInt16Downsample(input, inRate, OUT_SR)
     ws.send(buf)
@@ -194,12 +186,10 @@ async function startMic() {
   processor.connect(gain)
   gain.connect(audioCtx.destination)
   recording.value = true
-  sendPause()
 }
 
 function stopMic() {
   recording.value = false
-  recordPaused.value = false
   processor?.disconnect()
   sourceNode?.disconnect()
   processor = null
@@ -208,7 +198,6 @@ function stopMic() {
   mediaStream = null
   void audioCtx?.close()
   audioCtx = null
-  sendPause()
 }
 
 async function saveSnapshot() {
@@ -355,10 +344,6 @@ onBeforeUnmount(() => {
   stopMic()
   ws?.close()
 })
-
-function togglePause() {
-  sendPause()
-}
 </script>
 
 <template>
@@ -377,18 +362,9 @@ function togglePause() {
     <section class="card">
       <h2>Запись</h2>
       <p class="hint">
-        <strong>Пауза</strong> — при включённой записи не отправлять звук на сервер (микрофон остаётся включённым).
-        <strong>Остановить запись</strong> — полностью выключить микрофон.
+        <strong>Остановить запись</strong> — выключить микрофон. Кнопка «Заполнить протокол» сначала дорабатывает
+        распознавание по всей записи, затем строит протокол (это может занять время).
       </p>
-      <label class="row pause-row" :class="{ disabled: !recording }">
-        <input
-          v-model="recordPaused"
-          type="checkbox"
-          :disabled="!recording"
-          @change="togglePause"
-        />
-        Пауза
-      </label>
       <div class="row">
         <button v-if="!recording" type="button" @click="startMic">Начать запись</button>
         <button v-else type="button" class="danger" @click="stopMic">Остановить запись</button>
@@ -406,7 +382,7 @@ function togglePause() {
       <div class="draft-head">
         <h2>Черновик</h2>
         <button type="button" :disabled="finalizing || !consultationId" class="finalize-btn" @click="doFinalize">
-          {{ finalizing ? 'Обработка…' : 'Заполнить протокол' }}
+          {{ finalizing ? 'Черновик и протокол…' : 'Заполнить протокол' }}
         </button>
       </div>
       <pre class="draft">{{ draft || '—' }}</pre>
@@ -494,9 +470,6 @@ function togglePause() {
 }
 .draft-head h2 {
   margin: 0;
-}
-.pause-row.disabled {
-  opacity: 0.45;
 }
 .row {
   display: flex;

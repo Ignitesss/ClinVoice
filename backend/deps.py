@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Annotated, Optional
+from typing import Annotated, Callable, Optional
 
 import jwt
 from fastapi import Cookie, Depends, HTTPException, Request, status
@@ -13,7 +13,12 @@ from fastapi import Cookie, Depends, HTTPException, Request, status
 import auth
 import clinvoice_db
 from backend.settings import get_settings
-from clinvoice_asr import AudioTranscriberWithMetrics, resolve_hub_model_id
+from clinvoice_asr import (
+    WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS,
+    AudioTranscriberWithMetrics,
+    resolve_hub_model_id,
+    transcribe_pcm_s16le_mono,
+)
 
 log = logging.getLogger(__name__)
 
@@ -85,3 +90,21 @@ def get_transcriber_for_app(app) -> AudioTranscriberWithMetrics:
 
 def get_transcriber(request: Request) -> AudioTranscriberWithMetrics:
     return get_transcriber_for_app(request.app)
+
+
+def build_whisper_draft_recognizer(app) -> Callable[[bytes, str], str]:
+    """Тот же колбэк, что и для WebSocket: черновик Whisper по куску PCM + предыдущий текст."""
+
+    def _recognize_whisper(pcm_chunk: bytes, prev_draft: str) -> str:
+        transcriber = get_transcriber_for_app(app)
+        p = (prev_draft or "").strip()
+        ip = p[-WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS:] if p else None
+        return transcribe_pcm_s16le_mono(
+            transcriber,
+            pcm_chunk,
+            language="ru",
+            draft=True,
+            initial_prompt=ip,
+        )
+
+    return _recognize_whisper

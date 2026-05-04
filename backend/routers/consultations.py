@@ -6,11 +6,11 @@ import asyncio
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import clinvoice_db
-from backend.deps import get_current_user_id, get_db_path
+from backend.deps import build_whisper_draft_recognizer, get_current_user_id, get_db_path, get_transcriber_for_app
 from backend.settings import resolve_protocol_delay_sec
 from clinvoice_protocol_io import (
     build_structured_protocol_txt,
@@ -34,7 +34,6 @@ def _valid_uuid(s: str) -> bool:
 def _empty_snapshot() -> Dict[str, Any]:
     return {
         "live_transcript_editor": "",
-        "live_transcript_pause_auto_sync": False,
         "original_transcription": None,
         "doctor_transcript_editor": "",
         "protocol_editor_text": "",
@@ -53,7 +52,6 @@ def _merge_snapshot(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, An
 
 class SnapshotPatch(BaseModel):
     live_transcript_editor: Optional[str] = None
-    live_transcript_pause_auto_sync: Optional[bool] = None
     original_transcription: Optional[str] = None
     doctor_transcript_editor: Optional[str] = None
     protocol_editor_text: Optional[str] = None
@@ -151,6 +149,7 @@ def reset_audio(
 @router.post("/{consultation_id}/finalize")
 async def finalize(
     consultation_id: str,
+    request: Request,
     user_id: int = Depends(get_current_user_id),
     db_path: str = Depends(get_db_path),
 ) -> dict:
@@ -164,47 +163,58 @@ async def finalize(
     if len(pcm) < 3200:
         raise HTTPException(status_code=400, detail="Слишком короткая запись для Whisper")
 
-    whisper_txt = strip_whisper_tv_caption_artifacts(sess.draft_text())
-    if not whisper_txt:
-        raise HTTPException(
-            status_code=400,
-            detail="Черновик транскрипта пуст. Дождитесь появления текста во время записи или проверьте микрофон.",
-        )
-
-    await asyncio.sleep(resolve_protocol_delay_sec())
-
-    def _protocol():
-        return fill_protocol_from_transcript(whisper_txt)
-
+    sess.stop_live_draft()
     try:
-        protocol = await asyncio.to_thread(_protocol)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ошибка заполнения протокола: {e}") from e
+        transcriber = get_transcriber_for_app(request.app)
+        await asyncio.to_thread(sess.flush_pending_whisper_draft, transcriber)
 
-    consultation_date = format_consultation_date_gmt3()
-    editor_text = format_protocol_editor_text(consultation_date, protocol)
+        whisper_txt = strip_whisper_tv_caption_artifacts(sess.draft_text())
+        if not whisper_txt:
+            raise HTTPException(
+                status_code=400,
+                detail="Черновик транскрипта пуст. Дождитесь появления текста во время записи или проверьте микрофон.",
+            )
 
-    prev = clinvoice_db.load_latest_snapshot(db_path, consultation_id, user_id) or {}
-    merged = _merge_snapshot(_empty_snapshot(), prev)
-    merged["live_transcript_editor"] = whisper_txt
-    merged["original_transcription"] = whisper_txt
-    merged["doctor_transcript_editor"] = whisper_txt
-    merged["protocol_consultation_date"] = consultation_date
-    merged["protocol_editor_text"] = editor_text
-    merged["status"] = "draft"
-    clinvoice_db.save_draft_snapshot(db_path, consultation_id, user_id, merged)
+        await asyncio.sleep(resolve_protocol_delay_sec())
 
-    sess.clear_buffer()
+        def _protocol():
+            return fill_protocol_from_transcript(whisper_txt)
 
-    protocol_txt = build_structured_protocol_txt(protocol, consultation_date)
-    return {
-        "transcription": whisper_txt,
-        "protocol": protocol,
-        "protocol_editor_text": editor_text,
-        "protocol_consultation_date": consultation_date,
-        "transcript_txt": whisper_txt,
-        "protocol_txt": protocol_txt,
-    }
+        try:
+            protocol = await asyncio.to_thread(_protocol)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Ошибка заполнения протокола: {e}") from e
+
+        consultation_date = format_consultation_date_gmt3()
+        editor_text = format_protocol_editor_text(consultation_date, protocol)
+
+        prev = clinvoice_db.load_latest_snapshot(db_path, consultation_id, user_id) or {}
+        merged = _merge_snapshot(_empty_snapshot(), prev)
+        merged["live_transcript_editor"] = whisper_txt
+        merged["original_transcription"] = whisper_txt
+        merged["doctor_transcript_editor"] = whisper_txt
+        merged["protocol_consultation_date"] = consultation_date
+        merged["protocol_editor_text"] = editor_text
+        merged["status"] = "draft"
+        clinvoice_db.save_draft_snapshot(db_path, consultation_id, user_id, merged)
+
+        sess.clear_buffer()
+
+        protocol_txt = build_structured_protocol_txt(protocol, consultation_date)
+        return {
+            "transcription": whisper_txt,
+            "protocol": protocol,
+            "protocol_editor_text": editor_text,
+            "protocol_consultation_date": consultation_date,
+            "transcript_txt": whisper_txt,
+            "protocol_txt": protocol_txt,
+        }
+    finally:
+        sess.ensure_live_draft(
+            build_whisper_draft_recognizer(request.app),
+            overlap_bytes=0,
+            clear_state=False,
+        )
 
 
 @router.delete("/{consultation_id}/session")

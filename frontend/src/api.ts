@@ -7,7 +7,6 @@ export const http = axios.create({
 
 export type Snapshot = {
   live_transcript_editor: string
-  live_transcript_pause_auto_sync: boolean
   original_transcription: string | null
   doctor_transcript_editor: string
   protocol_editor_text: string

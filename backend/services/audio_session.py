@@ -10,13 +10,13 @@ from clinvoice_audio_utils import max_pcm_bytes
 
 if TYPE_CHECKING:
     from backend.services.live_draft_loop import LiveDraftBackgroundLoop
+    from clinvoice_asr import AudioTranscriberWithMetrics
 
 
 def _empty_shared() -> Dict[str, Any]:
     return {
         "lock": threading.Lock(),
         "pcm_accum": bytearray(),
-        "recording_paused": False,
         "draft_pcm_committed": 0,
         "live_draft_text": "",
         "live_draft_error": None,
@@ -34,13 +34,17 @@ class ConsultationAudioSession:
         recognize: Callable[[bytes, str], str],
         *,
         overlap_bytes: int = 0,
+        clear_state: bool = True,
     ) -> None:
         if self._draft_loop is not None:
             return
         from backend.services.live_draft_loop import LiveDraftBackgroundLoop
 
         self._draft_loop = LiveDraftBackgroundLoop(
-            self.shared, recognize, overlap_bytes=overlap_bytes
+            self.shared,
+            recognize,
+            overlap_bytes=overlap_bytes,
+            clear_state=clear_state,
         )
 
     def stop_live_draft(self) -> None:
@@ -53,8 +57,6 @@ class ConsultationAudioSession:
             return
         lk = self.shared["lock"]
         with lk:
-            if self.shared.get("recording_paused"):
-                return
             acc: bytearray = self.shared.setdefault("pcm_accum", bytearray())
             cap = max_pcm_bytes()
             if len(acc) + len(pcm) > cap:
@@ -64,9 +66,42 @@ class ConsultationAudioSession:
                 self.shared["draft_pcm_committed"] = max(0, c0 - overflow)
             acc.extend(pcm)
 
-    def set_paused(self, paused: bool) -> None:
-        with self.shared["lock"]:
-            self.shared["recording_paused"] = bool(paused)
+    def flush_pending_whisper_draft(self, transcriber: "AudioTranscriberWithMetrics") -> None:
+        """Догнать draft_pcm_committed до конца PCM (после остановки фонового цикла)."""
+        from clinvoice_asr import WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS, transcribe_pcm_s16le_mono
+        from backend.services.live_draft_loop import resolve_draft_tail_max_seconds
+
+        max_bytes = int(resolve_draft_tail_max_seconds() * 32000)
+        lk = self.shared["lock"]
+        while True:
+            with lk:
+                pcm = bytes(self.shared.get("pcm_accum") or b"")
+                committed = int(self.shared.get("draft_pcm_committed") or 0)
+            n = len(pcm)
+            if committed >= n:
+                return
+            take = min(n - committed, max_bytes)
+            chunk = pcm[committed : committed + take]
+            with lk:
+                prev = (self.shared.get("live_draft_text") or "").strip()
+            p = prev
+            ip = p[-WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS:] if p else None
+            text = transcribe_pcm_s16le_mono(
+                transcriber,
+                chunk,
+                language="ru",
+                draft=True,
+                initial_prompt=ip,
+            ).strip()
+            with lk:
+                cur_prev = (self.shared.get("live_draft_text") or "").strip()
+                t = (text or "").strip()
+                if t:
+                    if cur_prev:
+                        self.shared["live_draft_text"] = (cur_prev + " " + t).strip()
+                    else:
+                        self.shared["live_draft_text"] = t
+                self.shared["draft_pcm_committed"] = committed + take
 
     def clear_buffer(self) -> None:
         with self.shared["lock"]:

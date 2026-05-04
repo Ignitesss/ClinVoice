@@ -73,6 +73,7 @@ class LiveDraftBackgroundLoop:
         *,
         interval_sec: Optional[float] = None,
         overlap_bytes: Optional[int] = None,
+        clear_state: bool = True,
     ) -> None:
         self._shared = shared
         self._recognize = recognize
@@ -84,7 +85,7 @@ class LiveDraftBackgroundLoop:
         self._overlap_bytes = max(0, ov)
         self._stop = threading.Event()
         lk = shared.get("lock")
-        if lk:
+        if clear_state and lk:
             with lk:
                 shared["draft_pcm_committed"] = 0
                 shared["live_draft_text"] = ""
@@ -105,11 +106,8 @@ class LiveDraftBackgroundLoop:
             if self._stop.wait(self._interval):
                 break
             with lk:
-                paused = bool(self._shared.get("recording_paused"))
                 pcm = bytes(self._shared.get("pcm_accum") or b"")
                 committed = int(self._shared.get("draft_pcm_committed") or 0)
-            if paused:
-                continue
             n = len(pcm)
             if n - committed < self._min_new_bytes:
                 continue

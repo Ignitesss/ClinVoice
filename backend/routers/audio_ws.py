@@ -8,9 +8,8 @@ import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.deps import COOKIE_NAME, decode_token, get_transcriber_for_app
+from backend.deps import COOKIE_NAME, decode_token, build_whisper_draft_recognizer
 from backend.services.audio_session import get_audio_session
-from clinvoice_asr import WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS, transcribe_pcm_s16le_mono
 from clinvoice_audio_ingest import decode_audio_chunk, resample_pcm_s16le_mono
 from clinvoice_audio_utils import TARGET_SAMPLE_RATE_HZ
 
@@ -59,20 +58,7 @@ async def audio_stream(websocket: WebSocket) -> None:
         return
 
     sess = get_audio_session(cid)
-    transcriber = get_transcriber_for_app(websocket.app)
-
-    def _recognize_whisper(pcm_chunk: bytes, prev_draft: str) -> str:
-        p = (prev_draft or "").strip()
-        ip = p[-WHISPER_DYNAMIC_INITIAL_PROMPT_MAX_CHARS:] if p else None
-        return transcribe_pcm_s16le_mono(
-            transcriber,
-            pcm_chunk,
-            language="ru",
-            draft=True,
-            initial_prompt=ip,
-        )
-
-    sess.ensure_live_draft(_recognize_whisper, overlap_bytes=0)
+    sess.ensure_live_draft(build_whisper_draft_recognizer(websocket.app), overlap_bytes=0)
 
     last_draft = ""
     last_err = None
@@ -107,9 +93,7 @@ async def audio_stream(websocket: WebSocket) -> None:
                         payload = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(payload, dict) and payload.get("type") == "pause":
-                        sess.set_paused(bool(payload.get("value", False)))
-                    elif isinstance(payload, dict) and payload.get("type") == "ping":
+                    if isinstance(payload, dict) and payload.get("type") == "ping":
                         await websocket.send_json({"type": "pong"})
                 else:
                     b = msg.get("bytes")
